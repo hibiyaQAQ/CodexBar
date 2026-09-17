@@ -5,13 +5,16 @@ import Foundation
 nonisolated enum WorkflowHookEventRecorder {
     static let hookArgument = "--hook-event"
 
-    /// SessionEnd 在 Codex 中最多允许 3 秒, 其他事件沿用 5 秒
+    /// SessionEnd 和 Interrupt 在 Codex 中最多允许 3 秒, 其他事件沿用 5 秒
     /// 超时定义在这里而不是 CodexHookSettings: 写配置与下面的等锁预算必须同源
     private static let defaultHookTimeoutSeconds = 5
-    private static let sessionEndHookTimeoutSeconds = 3
+    private static let terminalHookTimeoutSeconds = 3
 
     static func hookTimeoutSeconds(for event: CodexHookEvent) -> Int {
-        event == .sessionEnd ? sessionEndHookTimeoutSeconds : defaultHookTimeoutSeconds
+        switch event {
+        case .sessionEnd, .interrupt: terminalHookTimeoutSeconds
+        default: defaultHookTimeoutSeconds
+        }
     }
 
     static func handleIfRequested() -> Bool {
@@ -43,7 +46,9 @@ nonisolated enum WorkflowHookEventRecorder {
         let turnId = payload.string(for: "turn_id")
         let agentId = payload.string(for: "agent_id")
         let transcriptPath = payload.string(for: "transcript_path")
-        let origin = WorkflowEventOriginReader.origin(transcriptPath: transcriptPath)
+        let sourcePath = hookEvent == .subagentStop
+            ? payload.string(for: "agent_transcript_path") : transcriptPath
+        let origin = WorkflowRolloutMetadataReader.origin(transcriptPath: sourcePath)
         let turnContext = readTurnContext(
             transcriptPath: transcriptPath,
             hookEvent: hookEvent,
@@ -187,16 +192,20 @@ nonisolated enum WorkflowHookEventRecorder {
     }
 }
 
-/// rollout 格式不是稳定 Hook 接口, 只读取首条完整 session_meta 并在固定预算内失败开放
-private nonisolated enum WorkflowEventOriginReader {
+/// Codex 把来源写在大型指令字段之前, 在固定预算内读取已完成的元数据字段
+nonisolated enum WorkflowRolloutMetadataReader {
     static func origin(transcriptPath: String?) -> WorkflowEventOrigin {
+        metadata(transcriptPath: transcriptPath)?.source?.origin ?? .unknown
+    }
+
+    static func metadata(transcriptPath: String?) -> WorkflowRolloutMetadataPayload? {
         guard let transcriptPath else {
-            return .unknown
+            return nil
         }
 
         let url = URL(fileURLWithPath: transcriptPath)
         guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return .unknown
+            return nil
         }
         defer {
             try? handle.close()
@@ -207,23 +216,78 @@ private nonisolated enum WorkflowEventOriginReader {
             let readCount = min(readChunkByteCount, firstLineByteLimit - data.count)
             guard let chunk = try? handle.read(upToCount: readCount),
                   !chunk.isEmpty else {
-                return .unknown
+                return nil
             }
             data.append(chunk)
 
-            guard let newlineIndex = data.firstIndex(of: JSONLines.newlineByte) else {
+            if let newlineIndex = data.firstIndex(of: JSONLines.newlineByte) {
+                return decodedMetadata(from: Data(data[..<newlineIndex]))
+            }
+
+            if let prefix = metadataPrefix(from: data),
+               let metadata = decodedMetadata(from: prefix), metadata.source != nil {
+                return metadata
+            }
+        }
+        return nil
+    }
+
+    private static func decodedMetadata(from data: Data) -> WorkflowRolloutMetadataPayload? {
+        guard let envelope = try? JSONDecoder().decode(WorkflowRolloutMetadataEnvelope.self, from: data),
+              envelope.type == "session_meta" else {
+            return nil
+        }
+        return envelope.payload
+    }
+
+    /// 只在外层或 payload 的完整字段边界补齐对象, 字符串和嵌套值交给 JSONDecoder 验证
+    private static func metadataPrefix(from data: Data) -> Data? {
+        var containers: [UInt8] = []
+        var isInString = false
+        var isEscaped = false
+        var prefixEnd: Int?
+        var closingBraces = 0
+
+        for (index, byte) in data.enumerated() {
+            if isInString {
+                if isEscaped {
+                    isEscaped = false
+                } else if byte == 0x5C {
+                    isEscaped = true
+                } else if byte == 0x22 {
+                    isInString = false
+                }
                 continue
             }
-            let line = Data(data[..<newlineIndex])
-            guard let envelope = try? JSONDecoder().decode(
-                WorkflowRolloutMetadataEnvelope.self,
-                from: line
-            ), envelope.type == "session_meta" else {
-                return .unknown
+
+            switch byte {
+            case 0x22:
+                isInString = true
+            case 0x7B, 0x5B:
+                guard containers.count < 64 else { return nil }
+                containers.append(byte)
+            case 0x7D, 0x5D:
+                let opening: UInt8 = byte == 0x7D ? 0x7B : 0x5B
+                guard containers.popLast() == opening else { return nil }
+                if containers.isEmpty {
+                    return data
+                }
+                if containers == [0x7B] {
+                    prefixEnd = index + 1
+                    closingBraces = 1
+                }
+            case 0x2C:
+                if containers == [0x7B] || containers == [0x7B, 0x7B] {
+                    prefixEnd = index
+                    closingBraces = containers.count
+                }
+            default:
+                break
             }
-            return envelope.payload?.source?.origin ?? .unknown
         }
-        return .unknown
+
+        guard let prefixEnd else { return nil }
+        return Data(data.prefix(prefixEnd)) + Data(repeating: 0x7D, count: closingBraces)
     }
 
     private static let readChunkByteCount = 32 * 1024
@@ -235,12 +299,26 @@ private nonisolated struct WorkflowRolloutMetadataEnvelope: Decodable {
     let payload: WorkflowRolloutMetadataPayload?
 }
 
-private nonisolated struct WorkflowRolloutMetadataPayload: Decodable {
+nonisolated struct WorkflowRolloutMetadataPayload: Decodable {
+    let id: String?
+    let sessionId: String?
+    private let explicitParentThreadId: String?
+    var parentThreadId: String? {
+        explicitParentThreadId ?? source?.parentThreadId
+    }
+
     let source: WorkflowRolloutSource?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, source
+        case sessionId = "session_id"
+        case explicitParentThreadId = "parent_thread_id"
+    }
 }
 
-private nonisolated struct WorkflowRolloutSource: Decodable {
+nonisolated struct WorkflowRolloutSource: Decodable {
     let origin: WorkflowEventOrigin
+    var parentThreadId: String?
 
     init(from decoder: Decoder) throws {
         if let name = try? decoder.singleValueContainer().decode(String.self) {
@@ -253,10 +331,9 @@ private nonisolated struct WorkflowRolloutSource: Decodable {
             return
         }
         if let subagentKey = container.allKeys.first(where: { $0.stringValue == "subagent" }) {
-            origin = (try? container.decode(
-                WorkflowRolloutSubagentSource.self,
-                forKey: subagentKey
-            ))?.origin ?? .unknown
+            let subagent = try? container.decode(WorkflowRolloutSubagentSource.self, forKey: subagentKey)
+            origin = subagent?.origin ?? .unknown
+            parentThreadId = subagent?.parentThreadId
             return
         }
         if let customKey = container.allKeys.first(where: { $0.stringValue == "custom" }),
@@ -278,6 +355,7 @@ private nonisolated struct WorkflowRolloutSource: Decodable {
 
 private nonisolated struct WorkflowRolloutSubagentSource: Decodable {
     let origin: WorkflowEventOrigin
+    var parentThreadId: String?
 
     init(from decoder: Decoder) throws {
         if let name = try? decoder.singleValueContainer().decode(String.self) {
@@ -289,6 +367,11 @@ private nonisolated struct WorkflowRolloutSubagentSource: Decodable {
               !container.allKeys.isEmpty else {
             origin = .unknown
             return
+        }
+        if let spawnKey = container.allKeys.first(where: { $0.stringValue == "thread_spawn" }),
+           let spawn = try? container.nestedContainer(keyedBy: WorkflowRolloutSourceKey.self, forKey: spawnKey),
+           let parentKey = spawn.allKeys.first(where: { $0.stringValue == "parent_thread_id" }) {
+            parentThreadId = try? spawn.decode(String.self, forKey: parentKey)
         }
         if let otherKey = container.allKeys.first(where: { $0.stringValue == "other" }) {
             guard let name = try? container.decode(String.self, forKey: otherKey),
@@ -334,7 +417,7 @@ private nonisolated enum WorkflowTurnContextReader {
 
         let offset = size > searchByteLimit ? size - searchByteLimit : 0
         guard (try? handle.seek(toOffset: offset)) != nil,
-              let data = try? handle.readToEnd(),
+              let data = try? handle.read(upToCount: Int(size - offset)),
               !data.isEmpty else {
             return nil
         }
@@ -356,7 +439,7 @@ private nonisolated enum WorkflowTurnContextReader {
         return nil
     }
 
-    private static let searchByteLimit: UInt64 = 512 * 1024
+    private static let searchByteLimit: UInt64 = 8 * 1024 * 1024
 }
 
 private nonisolated struct WorkflowTurnContext {

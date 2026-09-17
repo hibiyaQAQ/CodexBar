@@ -62,6 +62,7 @@ CodexBar 是面向 macOS 15 及更高版本的菜单栏 App，集中展示 Codex
 - 主面板展示当前任务、项目、模型、推理强度和持续时间
 - 任务中心集中查看并发任务、最近完成和最近终止记录
 - 支持任务完成、等待批准和异常会话提醒
+- 可选任务流光，在屏幕顶部提示本机和远程 Codex、Claude 的任务状态
 
 ### 让长任务安心运行
 
@@ -100,8 +101,8 @@ bash Scripts/build-local.sh
 
 - macOS 15.0 或更高版本
 - 已安装并登录 [Codex CLI](https://github.com/openai/codex) 或安装了内置 Codex 的 ChatGPT App 或 Codex App
-- 当前运行的 Codex 版本需要为 `0.143.0` 或更高版本
-- 使用实时任务等 Hook 功能时，当前运行的 Codex 版本需要为 `0.145.0` 或更高版本
+- 当前运行的 Codex 版本需要为 `0.145.0` 或更高版本
+- 使用实时任务等 Hook 功能时，当前运行的 Codex 版本需要为 `0.150.0` 或更高版本
 - 采集本机或远程日志需要 Python 3.9 或更高版本，无需额外 Python 包
 - Claude 统计需要可读取的会话日志；5h/7d 额度取决于客户端是否留下相应记录
 

@@ -14,6 +14,9 @@ final class CodexBarAppDelegate: NSObject, NSApplicationDelegate {
     lazy var codexCLINotificationSettings = CodexCLINotificationSettings(
         codexStatusService: codexStatusService
     )
+    let taskGlowSettings = TaskGlowSettings()
+    lazy var activityPresentation = ActivityPresentationModel(local: activityMonitor, usage: usageCenterViewModel)
+    private lazy var taskGlowController = TaskGlowController(settings: taskGlowSettings, activityPresentation: activityPresentation, hookSettings: codexHookSettings)
     let activityProtectionSettings = ActivityProtectionSettings()
     lazy var activityMonitor = CodexActivityMonitor(
         codexHookSettings: codexHookSettings,
@@ -57,6 +60,8 @@ final class CodexBarAppDelegate: NSObject, NSApplicationDelegate {
             codexHookSettings: codexHookSettings,
             codexCLINotificationSettings: codexCLINotificationSettings,
             activityMonitor: activityMonitor,
+            activityPresentation: activityPresentation,
+            taskGlowSettings: taskGlowSettings,
             globalHotKeySettings: globalHotKeySettings,
             menuBarQuotaSettings: menuBarQuotaSettings,
             mainPanelSettings: mainPanelSettings,
@@ -111,6 +116,7 @@ final class CodexBarAppDelegate: NSObject, NSApplicationDelegate {
             notificationService?.invalidateActivityProtectionNotification(taskID: taskID, attemptID: attemptID)
         }
         activityMonitor.start()
+        taskGlowController.start()
         keepAliveController.start()
         logLaunchState()
     }
@@ -125,6 +131,7 @@ final class CodexBarAppDelegate: NSObject, NSApplicationDelegate {
         usageCenterViewModel.stop()
         autoResetController?.stop()
         keepAliveController.stop()
+        taskGlowController.stop()
         activityMonitor.stop()
     }
 

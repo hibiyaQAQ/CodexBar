@@ -23,6 +23,13 @@ enum CodexActivityTaskKey: Hashable {
         }
     }
 
+    var turnId: String? {
+        if case let .turn(_, turn) = self {
+            return turn
+        }
+        return nil
+    }
+
     var isAnonymous: Bool {
         if case .anonymous = self {
             return true
@@ -56,11 +63,6 @@ enum CodexActivityTaskKey: Hashable {
     static func projectIdentifier(_ project: String?) -> String {
         project ?? "__codex__"
     }
-}
-
-enum CodexActivityLiveTransition {
-    case waitingApproval(CodexActivityTaskKey)
-    case completed(CodexActivityCompletion)
 }
 
 enum CodexActivityEventSource {
@@ -108,11 +110,19 @@ struct PendingTerminalTask {
     var task: CodexActivityTask
     let supersededAt: Date
     let deadline: Date
+    var nextPollAt: Date = .distantPast
+    var expiresAt: Date {
+        supersededAt.addingTimeInterval(CodexActivityRetention.window)
+    }
 }
 
 struct CodexActivityTask {
     let displayID: UUID
     let key: CodexActivityTaskKey
+    var associatedTurnId: String?
+    var lifecycleCoverageCheckedAt: Date?
+    var incompleteTailCheckedAt: Date?
+    var incompleteTailUnchangedSince: Date?
     var state: CodexActivityTaskState
     var latestEvent: CodexActivityEvent
     var projectName: String?
@@ -121,11 +131,10 @@ struct CodexActivityTask {
     var toolName: String?
     var startedAt: Date?
     var stateChangedAt: Date
-    var lastActivityAt: Date
+    var lastHookEventAt: Date
     var lastProgressAt: Date
     var progressGeneration: UInt64
-    var approvalReviewer: CodexApprovalReviewer?
-    var pendingApprovalRequestedAt: Date?
+    var executions: [CodexActivityExecutionKey: CodexActivityExecution] = [:]
     var subagentsByID: [String: CodexSubagentObservation]
     var isSubagentCountReliable: Bool
 
@@ -140,6 +149,7 @@ struct CodexActivityTask {
     ) {
         self.displayID = displayID
         self.key = key
+        associatedTurnId = key.turnId
         self.state = state
         self.latestEvent = latestEvent
         projectName = event.projectDisplayName
@@ -148,13 +158,12 @@ struct CodexActivityTask {
         toolName = event.toolName
         self.startedAt = startedAt
         stateChangedAt = event.timestamp
-        lastActivityAt = event.timestamp
+        lastHookEventAt = event.timestamp
         lastProgressAt = event.timestamp
         self.progressGeneration = progressGeneration
-        approvalReviewer = event.approvalReviewer
-        pendingApprovalRequestedAt = nil
         subagentsByID = [:]
         isSubagentCountReliable = startedAt != nil
+        recordExecutionEvent(event)
     }
 
     var showsPreciseDuration: Bool {
@@ -173,11 +182,11 @@ struct CodexActivityTask {
         CodexActivityTaskSnapshot(
             id: displayID,
             isAnonymous: key.isAnonymous,
-            latestEvent: latestEvent,
+            latestEvent: displayedApproval == nil ? latestEvent : .approvalRequested,
             projectName: projectName,
             modelName: modelName,
             effort: effort,
-            toolName: toolName,
+            toolName: displayedApproval.map(\.toolName) ?? toolName,
             startedAt: startedAt,
             stateChangedAt: stateChangedAt,
             showsPreciseDuration: showsPreciseDuration,
@@ -186,7 +195,7 @@ struct CodexActivityTask {
     }
 
     var turnReference: CodexActivityTurnReference? {
-        guard case let .turn(sessionId, turnId) = key else {
+        guard let sessionId = key.sessionId, let turnId = associatedTurnId else {
             return nil
         }
         return CodexActivityTurnReference(
@@ -198,23 +207,64 @@ struct CodexActivityTask {
 
     var promptReference: CodexActivityPromptReference? {
         guard startedAt == nil,
-              case let .turn(sessionId, turnId) = key else {
+              let sessionId = key.sessionId, let turnId = associatedTurnId else {
             return nil
         }
         return CodexActivityPromptReference(sessionId: sessionId, turnId: turnId)
     }
 
+    var resolvedTurnKey: CodexActivityTaskKey? {
+        guard let session = key.sessionId, let turn = associatedTurnId else { return nil }
+        return .turn(session: session, turn: turn)
+    }
+
+    var lastActivityAt: Date {
+        lastProgressAt
+    }
+
+    func hasFreshLifecycle(at now: Date) -> Bool {
+        lifecycleCoverageCheckedAt.map { now.timeIntervalSince($0) < 5 } == true
+    }
+
+    mutating func recordLifecycleRead(_ state: CodexSessionTaskLifecycleState, at now: Date) {
+        lifecycleCoverageCheckedAt = state.readStatus == .complete && state.hasContext ? now : nil
+        incompleteTailUnchangedSince = state.readStatus == .incomplete && state.hasContext ? state.incompleteTailUnchangedSince : nil
+        incompleteTailCheckedAt = incompleteTailUnchangedSince == nil ? nil : now
+    }
+
+    /// 阈值调整与隐藏共用计时起点, 恢复不要求读取结果仍在有效期内
+    var activityProtectionReferenceAt: Date {
+        max(lastProgressAt, incompleteTailUnchangedSince ?? lastProgressAt)
+    }
+
+    /// 隐藏还要求新鲜的读取依据, 半行观察不作为完整覆盖或任务进展
+    func activityProtectionDeadline(at now: Date, inactivityDuration: TimeInterval) -> Date? {
+        if hasFreshLifecycle(at: now) {
+            return activityProtectionReferenceAt.addingTimeInterval(inactivityDuration)
+        }
+        guard let incompleteTailCheckedAt, now.timeIntervalSince(incompleteTailCheckedAt) < 5,
+              incompleteTailUnchangedSince != nil else { return nil }
+        return activityProtectionReferenceAt.addingTimeInterval(inactivityDuration)
+    }
+
     mutating func mergeMetadata(from event: WorkflowHookEvent) {
+        if associatedTurnId == nil, !key.isAnonymous, event.agentId == nil {
+            associatedTurnId = event.turnId
+        }
         projectName = event.projectDisplayName ?? projectName
         modelName = event.modelName ?? modelName
         _ = mergeEffort(event.effort)
         toolName = event.toolName ?? toolName
-        approvalReviewer = event.approvalReviewer ?? approvalReviewer
+    }
+
+    /// Hook 顺序独立于 rollout 进展, 避免用量记录使稍早的状态事件失效
+    mutating func recordHookEvent(at timestamp: Date) {
+        lastHookEventAt = max(lastHookEventAt, timestamp)
+        recordProgress(at: timestamp)
     }
 
     mutating func recordProgress(at timestamp: Date) {
-        lastActivityAt = max(lastActivityAt, timestamp)
-        lastProgressAt = timestamp
+        lastProgressAt = max(lastProgressAt, timestamp)
         progressGeneration &+= 1
     }
 
@@ -237,6 +287,7 @@ struct CodexActivityTask {
     mutating func recordSubagentActivity(
         agentId: String?,
         isStarting: Bool,
+        hasEnded: Bool = false,
         at timestamp: Date
     ) {
         guard let agentId else {
@@ -252,7 +303,7 @@ struct CodexActivityTask {
             isSubagentCountReliable = false
         }
         subagentsByID[agentId] = CodexSubagentObservation(
-            isRunning: isStarting,
+            isRunning: isStarting && !hasEnded,
             timestamp: timestamp
         )
     }
@@ -276,28 +327,182 @@ struct CodexActivityTask {
         return value.isEmpty ? nil : value
     }
 
-    /// 记录审批候选; 返回值只表示任务是否刚刚进入用户等待状态
-    mutating func recordApprovalRequest(at requestedAt: Date) -> Bool {
-        pendingApprovalRequestedAt = requestedAt
-        guard approvalReviewer == .user else {
-            return false
+    var displayedApproval: CodexActivityApproval? {
+        executions.values.compactMap { execution -> CodexActivityApproval? in
+            guard case let .waiting(approval)? = execution.approval else { return nil }
+            return approval
+        }.min {
+            if $0.requestedAt != $1.requestedAt {
+                return $0.requestedAt < $1.requestedAt
+            }
+            return $0.sequence < $1.sequence
         }
-
-        let enteredWaiting = state != .waitingApproval
-        confirmPendingApproval()
-        return enteredWaiting
     }
 
-    mutating func confirmPendingApproval() {
-        guard let requestedAt = pendingApprovalRequestedAt else {
-            return
+    func executionKey(for event: WorkflowHookEvent) -> CodexActivityExecutionKey {
+        CodexActivityExecutionKey(
+            agentId: event.agentId,
+            turnId: event.turnId,
+            isUnattributed: event.agentId == nil && event.origin != .main
+        )
+    }
+
+    var lastMainHookEventAt: Date {
+        executions.filter { $0.key.agentId == nil && !$0.key.isUnattributed }
+            .values.map(\.lastHookEventAt).max() ?? startedAt ?? .distantPast
+    }
+
+    func acceptsExecutionEvent(_ event: WorkflowHookEvent) -> Bool {
+        let execution = executions[executionKey(for: event)]
+        return execution?.isTerminal != true && event.timestamp >= (execution?.lastHookEventAt ?? .distantPast)
+    }
+
+    mutating func recordExecutionEvent(_ event: WorkflowHookEvent) {
+        let owner = executionKey(for: event)
+        var execution = executions[owner] ?? CodexActivityExecution()
+        execution.lastHookEventAt = max(execution.lastHookEventAt, event.timestamp)
+        execution.mergeReviewer(event.approvalReviewer, at: event.timestamp)
+        executions[owner] = execution
+    }
+
+    mutating func resumeExecution(from event: WorkflowHookEvent, latestEvent: CodexActivityEvent) {
+        recordExecutionEvent(event)
+        let owner = executionKey(for: event)
+        if owner.isReliable, var execution = executions[owner] {
+            execution.approval = nil
+            execution.lastExecutionProgressAt = max(execution.lastExecutionProgressAt ?? .distantPast, event.timestamp)
+            executions[owner] = execution
         }
-        pendingApprovalRequestedAt = nil
-        if state != .waitingApproval {
-            state = .waitingApproval
-            stateChangedAt = requestedAt
+        self.latestEvent = latestEvent
+        refreshApprovalState(at: event.timestamp, restoresRunning: true)
+    }
+
+    /// 审批路由未知时只保存候选, 后续上下文只能确认同一执行归属
+    mutating func recordApprovalRequest(from event: WorkflowHookEvent) -> Bool {
+        let wasWaiting = state == .waitingApproval
+        let owner = executionKey(for: event)
+        guard event.timestamp > (executions[owner]?.lastApprovalRequestedAt ?? .distantPast),
+              event.timestamp >= (executions[owner]?.lastExecutionProgressAt ?? .distantPast) else { return false }
+        recordExecutionEvent(event)
+        executions[owner]?.lastApprovalRequestedAt = event.timestamp
+        if executions[owner]?.approval == nil {
+            executions[owner]?.approval = .pending(CodexActivityApproval(
+                requestedAt: event.timestamp, toolName: event.toolName, sequence: progressGeneration
+            ))
         }
-        latestEvent = .approvalRequested
+        _ = resolvePendingApprovals()
+        return !wasWaiting && state == .waitingApproval
+    }
+
+    @discardableResult
+    mutating func resolvePendingApprovals() -> Bool {
+        var changed = false
+        for owner in executions.keys {
+            guard var execution = executions[owner], case let .pending(pending)? = execution.approval,
+                  let reviewer = execution.approvalReviewer else { continue }
+            execution.approval = reviewer == .user ? .waiting(pending) : nil
+            executions[owner] = execution
+            changed = true
+        }
+        if changed {
+            refreshApprovalState(at: displayedApproval?.requestedAt ?? lastProgressAt)
+        }
+        return changed
+    }
+
+    mutating func mergeApprovalContext(
+        reviewer: CodexApprovalReviewer?, observedAt: Date?, owner: CodexActivityExecutionKey
+    ) {
+        guard let observedAt else { return }
+        var execution = executions[owner] ?? CodexActivityExecution()
+        execution.mergeReviewer(reviewer, at: observedAt)
+        executions[owner] = execution
+    }
+
+    mutating func mergeExecutionLifecycle(_ lifecycle: CodexSessionTaskLifecycleState, owner: CodexActivityExecutionKey) {
+        guard lifecycle.readStatus == .complete else { return }
+        if lifecycle.terminal != nil {
+            finishExecution(owner, at: lifecycle.lastProgressAt ?? lastProgressAt)
+        } else {
+            mergeApprovalContext(reviewer: lifecycle.approvalReviewer, observedAt: lifecycle.contextObservedAt, owner: owner)
+            mergeExecutionProgress(at: lifecycle.lastExecutionProgressAt, owner: owner)
+        }
+    }
+
+    mutating func mergeExecutionProgress(at timestamp: Date?, owner: CodexActivityExecutionKey) {
+        guard owner.isReliable, let timestamp else { return }
+        var execution = executions[owner] ?? CodexActivityExecution()
+        execution.lastExecutionProgressAt = max(execution.lastExecutionProgressAt ?? .distantPast, timestamp)
+        if let approval = execution.approval, timestamp > approval.request.requestedAt {
+            execution.approval = nil
+        }
+        executions[owner] = execution
+        refreshApprovalState(at: timestamp)
+    }
+
+    mutating func finishExecution(_ owner: CodexActivityExecutionKey, at timestamp: Date) {
+        var execution = executions[owner] ?? CodexActivityExecution()
+        execution.approval = nil
+        execution.isTerminal = true
+        executions[owner] = execution
+        refreshApprovalState(at: timestamp)
+    }
+
+    private mutating func refreshApprovalState(at timestamp: Date, restoresRunning: Bool = false) {
+        if let approval = displayedApproval {
+            if state != .waitingApproval {
+                state = .waitingApproval
+                stateChangedAt = approval.requestedAt
+            }
+        } else if state == .waitingApproval || restoresRunning {
+            if state != .running {
+                state = .running
+                stateChangedAt = timestamp
+            }
+        }
+    }
+}
+
+struct CodexActivityExecutionKey: Hashable {
+    let agentId: String?
+    let turnId: String?
+    var isUnattributed = false
+
+    var isReliable: Bool {
+        turnId != nil && !isUnattributed
+    }
+}
+
+struct CodexActivityApproval {
+    let requestedAt: Date
+    let toolName: String?
+    let sequence: UInt64
+}
+
+enum CodexActivityApprovalState {
+    case pending(CodexActivityApproval)
+    case waiting(CodexActivityApproval)
+
+    var request: CodexActivityApproval {
+        switch self {
+        case let .pending(request), let .waiting(request): request
+        }
+    }
+}
+
+struct CodexActivityExecution {
+    var lastHookEventAt: Date = .distantPast
+    var approvalReviewer: CodexApprovalReviewer?
+    var approvalContextObservedAt: Date?
+    var lastExecutionProgressAt: Date?
+    var lastApprovalRequestedAt: Date?
+    var approval: CodexActivityApprovalState?
+    var isTerminal = false
+
+    mutating func mergeReviewer(_ reviewer: CodexApprovalReviewer?, at timestamp: Date) {
+        guard let reviewer, timestamp >= (approvalContextObservedAt ?? .distantPast) else { return }
+        approvalReviewer = reviewer
+        approvalContextObservedAt = timestamp
     }
 }
 

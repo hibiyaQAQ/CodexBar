@@ -2,6 +2,7 @@
 """本地 Hook 状态与 SSH 实时快照, 不读取对话内容或访问模型服务"""
 import argparse
 import ctypes
+import datetime
 import hashlib
 import json
 import os
@@ -24,7 +25,7 @@ LIMIT = 512 * 1024
 
 
 def events_for(provider):
-    return EVENTS + (("PostToolUseFailure",) if provider == "claude" else ())
+    return EVENTS + (("PostToolUseFailure", "StopFailure") if provider == "claude" else ("Interrupt",))
 
 
 def directory():
@@ -91,47 +92,175 @@ def parent_identity(provider):
     return 0, ""
 
 
+def identifier(value):
+    if isinstance(value, str) and 0 < len(value) <= 512:
+        return hashlib.sha256(value.encode()).hexdigest()
+    return None
+
+
+def transcript_path(payload, provider):
+    value = payload.get("transcript_path")
+    if not isinstance(value, str):
+        return None
+    home = Path(os.environ.get("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR", str(Path.home() / ("." + provider)))).expanduser().resolve()
+    path = Path(value).expanduser().resolve()
+    folders = ("sessions", "archived_sessions") if provider == "codex" else ("projects",)
+    return str(path) if any(path.is_relative_to(home / folder) for folder in folders) else None
+
+
+def load_details(db, task_id, updated):
+    row = db.execute("SELECT payload FROM details WHERE id=?", (task_id,)).fetchone()
+    value = json.loads(row[0]) if row else {}
+    return value if value.get("observedAt") == updated else {}
+
+
 def record(db, payload, provider, now=None):
     event = payload.get("hook_event_name")
     session = payload.get("session_id")
     if event not in events_for(provider) or not isinstance(session, str) or not 0 < len(session) <= 512:
         return
+    metadata = model_metadata(payload, provider)
+    if metadata.get("ignored"):
+        return
     task_id = hashlib.sha256((provider + "\0" + session).encode()).hexdigest()
     now = time.time() if now is None else now
-    model = model_name(payload, provider)
-    if model:
-        with db:
-            db.execute("INSERT OR REPLACE INTO models VALUES(?,?,?)", (task_id, model, now))
-            db.execute("DELETE FROM models WHERE updated<?", (now - 86400,))
-    # 会话启动只记录模型, 不代表已有任务运行
+    agent = identifier(payload.get("agent_id"))
+    turn = identifier(payload.get("turn_id")) if provider == "codex" else None
+    if provider == "codex" and metadata.get("parentSession"):
+        owners = db.execute("SELECT a.parent FROM agents a JOIN tasks t ON t.id=a.parent WHERE a.agent=? AND t.provider='codex'", (identifier(session),)).fetchall()
+        task_id = owners[0][0] if len(owners) == 1 else hashlib.sha256((provider + "\0" + metadata["parentSession"]).encode()).hexdigest()
+        agent = identifier(session)
+    model = metadata.get("model") if not agent else None
+    path = transcript_path(payload, provider)
     if event == "SessionStart":
+        if model:
+            with db:
+                db.execute("INSERT OR REPLACE INTO models VALUES(?,?,?)", (task_id, model, now))
+                db.execute("DELETE FROM models WHERE updated<?", (now - 86400,))
         return
-    state = {"PermissionRequest": "waiting", "Stop": "completed", "SessionEnd": "ended"}.get(event, "running")
     cwd = payload.get("cwd", "")
     project = Path(cwd).name[:100] if isinstance(cwd, str) else ""
     project = "".join(char for char in project if char.isprintable())
     pid, birth = parent_identity(provider)
+    terminal = event in ("Stop", "StopFailure", "SessionEnd", "Interrupt")
+    subagent_event = event in ("SubagentStart", "SubagentStop")
     with db:
-        previous = db.execute("SELECT state,started,pid,birth FROM tasks WHERE id=?", (task_id,)).fetchone()
-        # 结束会话不等于终止任务, 空会话和已完成任务不能被结束事件重建或覆盖
-        if event in ("Stop", "SessionEnd") and (not previous or previous[0] not in ("running", "waiting", "unknown")):
+        # 并发 Hook 先获得写锁再读取旧状态, 避免相互覆盖审批和轮次
+        db.execute("BEGIN IMMEDIATE")
+        previous = db.execute("SELECT state,started,pid,birth,updated FROM tasks WHERE id=?", (task_id,)).fetchone()
+        details = load_details(db, task_id, previous[4]) if previous else {}
+        if previous and now < previous[4]:
             return
-        if event in ("SubagentStart", "SubagentStop"):
-            if not previous or previous[0] not in ("running", "waiting", "unknown"):
+        if terminal and (not previous or previous[0] not in ("running", "waiting", "unknown")):
+            return
+        if subagent_event and (not previous or previous[0] not in ("running", "waiting", "unknown")):
+            return
+        old_turn = details.get("turnKey")
+        root_turn = identifier(metadata.get("rootTurn"))
+        if agent and root_turn and old_turn and root_turn != old_turn:
+            return
+        if not agent and turn and turn != old_turn and old_turn and event != "UserPromptSubmit":
+            return
+        if event == "UserPromptSubmit":
+            if turn and turn == old_turn:
                 return
-            state = previous[0]
-        started = previous[1] if previous and previous[0] in ("running", "waiting", "unknown") and event != "UserPromptSubmit" else now
-        if previous and not pid:
-            pid, birth = previous[2:]
-        db.execute("INSERT OR REPLACE INTO tasks VALUES(?,?,?,?,?,?,?,?)",
-                   (task_id, provider, state, project, now, started, pid, birth))
-        record_details(db, task_id, payload, event, now)
+            if agent or (turn and turn in details.get("endedTurns", [])):
+                return
+            ended = details.get("endedTurns", [])
+            if old_turn and old_turn != turn:
+                ended = (ended + [old_turn])[-16:]
+            details = {"turnKey": turn, "endedTurns": ended, "activeSubagentCount": 0}
+            db.execute("DELETE FROM agents WHERE parent=?", (task_id,))
+        elif turn and not old_turn and not agent:
+            details["turnKey"] = turn
+        # 子任务事件必须先关联本轮, 迟到事件不能复活上一轮或结束主任务
+        if agent and event != "SubagentStart":
+            if not db.execute("SELECT 1 FROM agents WHERE parent=? AND agent=?", (task_id, agent)).fetchone():
+                if provider == "codex" and previous and root_turn and root_turn == old_turn:
+                    db.execute("INSERT OR IGNORE INTO agents VALUES(?,?)", (task_id, agent))
+                else:
+                    return
+        if agent and event == "SubagentStart":
+            if db.execute("SELECT COUNT(*) FROM agents WHERE parent=?", (task_id,)).fetchone()[0] < 1000:
+                db.execute("INSERT OR IGNORE INTO agents VALUES(?,?)", (task_id, agent))
+        if model:
+            db.execute("INSERT OR REPLACE INTO models VALUES(?,?,?)", (task_id, model, now))
+            db.execute("DELETE FROM models WHERE updated<?", (now - 86400,))
+        owner = agent or "main"
+        waits = details.get("waits", {})
+        if previous and previous[0] == "waiting" and "waits" not in details:
+            waits = {"main": {"unknown": None}}
+        tool_id = identifier(payload.get("tool_use_id") or payload.get("call_id")) or "unknown"
+        tool = payload.get("tool_name")
+        tool = tool if isinstance(tool, str) and 0 < len(tool) <= 120 and tool.isprintable() else None
+        reviewers = details.get("reviewers", {})
+        reviewer = metadata.get("reviewer")
+        if reviewer in ("user", "guardian", "auto"):
+            reviewers[owner] = reviewer
+            if reviewer != "user":
+                waits.pop(owner, None)
+        if event == "PermissionRequest" and not (provider == "codex" and reviewer in ("guardian", "auto")):
+            if sum(len(v) for v in waits.values()) < 1000:
+                waits.setdefault(owner, {})[tool_id] = tool
+        elif event in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+            if owner in waits:
+                waits[owner].pop(tool_id, None)
+                if not waits[owner]:
+                    waits.pop(owner)
+        state = "waiting" if any(provider == "claude" or reviewers.get(key) == "user" for key in waits) else "unknown" if waits else "running"
+        started = previous[1] if previous and event != "UserPromptSubmit" else now
+        if previous and (agent or not pid):
+            pid, birth = previous[2:4]
+        if path and not agent:
+            details["transcriptPath"] = path
+        effort = metadata.get("effort") or payload.get("reasoning_effort")
+        if isinstance(effort, str) and 0 < len(effort) <= 40 and effort.isprintable() and not agent:
+            details["effort"] = effort
+        if agent and (terminal or event == "SubagentStop" or (event == "PostToolUseFailure" and payload.get("is_interrupt") is True)):
+            db.execute("DELETE FROM agents WHERE parent=? AND agent=?", (task_id, agent))
+            waits.pop(owner, None)
+            state = "waiting" if any(provider == "claude" or reviewers.get(key) == "user" for key in waits) else "unknown" if waits else "running"
+            event = "SubagentStop"
+        elif event == "SessionEnd" and (provider == "codex" or details.get("pendingStop") is not None):
+            details.setdefault("pendingStop", now)
+            details["sessionEnded"] = True
+        elif event in ("SessionEnd", "Interrupt", "StopFailure") or (event == "PostToolUseFailure" and payload.get("is_interrupt") is True):
+            state = "ended"
+            details.pop("pendingStop", None)
+            waits = {}
+            db.execute("DELETE FROM agents WHERE parent=?", (task_id,))
+        elif event == "Stop":
+            # Codex 的 Stop 在终态前触发; Claude 留出其他 Stop Hook 继续执行的窗口
+            details["pendingStop"] = now
+            details.pop("rolloutCursor", None)
+        elif not agent and event not in ("SubagentStart", "SubagentStop"):
+            details.pop("pendingStop", None)
+            details.pop("rolloutCursor", None)
+            details.pop("sessionEnded", None)
+        if state == "ended" and turn:
+            details["endedTurns"] = (details.get("endedTurns", []) + [turn])[-16:]
+        wait_started = details.get("waitStarted", {})
+        fallback = previous[4] if previous and previous[0] == "waiting" else now
+        wait_started = {key: {call: wait_started.get(key, {}).get(call, now if event == "PermissionRequest" and key == owner and call == tool_id else fallback) for call in owned} for key, owned in waits.items()}
+        known_waits = [(wait_started[key][call], name) for key, owned in waits.items()
+                       if provider == "claude" or reviewers.get(key) == "user" for call, name in owned.items()]
+        changed_at = details.get("stateChangedAt", previous[4] if previous else now)
+        if state == "waiting" and known_waits:
+            changed_at, tool = min(known_waits, key=lambda item: item[0])
+        elif not previous or state != previous[0]:
+            changed_at = now
+        details.update(observedAt=now, eventName="PermissionRequest" if waits else event,
+                       toolName=tool, waits=waits, reviewers=reviewers, waitStarted=wait_started,
+                       stateChangedAt=changed_at)
+        if details.get("activeSubagentCount") is not None:
+            details["activeSubagentCount"] = db.execute("SELECT COUNT(*) FROM agents WHERE parent=?", (task_id,)).fetchone()[0]
+        db.execute("INSERT OR REPLACE INTO tasks VALUES(?,?,?,?,?,?,?,?)", (task_id, provider, state, project, now, started, pid, birth))
+        db.execute("INSERT OR REPLACE INTO details VALUES(?,?)", (task_id, json.dumps(details)))
         db.execute("UPDATE meta SET revision=revision+1")
         db.execute("DELETE FROM tasks WHERE updated<?", (now - 86400,))
         db.execute("DELETE FROM tasks WHERE id NOT IN (SELECT id FROM tasks ORDER BY updated DESC LIMIT 500)")
         db.execute("DELETE FROM details WHERE id NOT IN (SELECT id FROM tasks)")
         db.execute("DELETE FROM agents WHERE parent NOT IN (SELECT id FROM tasks)")
-    # WAL 写事件可能早于事务提交, 提交后单独发信号才不会读到旧快照后永久漏更
     root = Path(db.execute("PRAGMA database_list").fetchone()[2]).parent
     descriptor = os.open(root / "activity.notify", os.O_WRONLY)
     try:
@@ -140,43 +269,131 @@ def record(db, payload, provider, now=None):
         os.close(descriptor)
 
 
-def record_details(db, task_id, payload, event, now):
-    previous = db.execute("SELECT payload FROM details WHERE id=?", (task_id,)).fetchone()
-    details = json.loads(previous[0]) if previous else {}
-    tool = payload.get("tool_name")
-    if not (event in ("SubagentStart", "SubagentStop") and details.get("eventName") == "PermissionRequest"):
-        details["eventName"] = event
-        details["toolName"] = tool if isinstance(tool, str) and 0 < len(tool) <= 120 and tool.isprintable() else None
-    details["observedAt"] = now
-    if event == "UserPromptSubmit":
-        db.execute("DELETE FROM agents WHERE parent=?", (task_id,))
-        details["activeSubagentCount"] = 0
-    agent = payload.get("agent_id")
-    if isinstance(agent, str) and 0 < len(agent) <= 512:
-        agent_key = hashlib.sha256(agent.encode()).hexdigest()
-        if event == "SubagentStart":
-            count = db.execute("SELECT COUNT(*) FROM agents WHERE parent=?", (task_id,)).fetchone()[0]
-            if count < 1000:
-                db.execute("INSERT OR IGNORE INTO agents VALUES(?,?)", (task_id, agent_key))
-        elif event == "SubagentStop":
-            db.execute("DELETE FROM agents WHERE parent=? AND agent=?", (task_id, agent_key))
-    if event in ("Stop", "SessionEnd"):
-        db.execute("DELETE FROM agents WHERE parent=?", (task_id,))
-    if details.get("activeSubagentCount") is not None:
-        details["activeSubagentCount"] = db.execute("SELECT COUNT(*) FROM agents WHERE parent=?", (task_id,)).fetchone()[0]
-    db.execute("INSERT OR REPLACE INTO details VALUES(?,?)", (task_id, json.dumps(details)))
+def event_time(value):
+    try:
+        if isinstance(value, str):
+            return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value / 1000 if value > 100000000000 else float(value)
+    except (ValueError, OverflowError):
+        pass
+    return None
 
 
-def reconcile(db):
-    now = time.time()
-    with db:
-        for task_id, pid, birth, updated in db.execute(
-                "SELECT id,pid,birth,updated FROM tasks WHERE state IN ('running','waiting')").fetchall():
+def codex_terminal(details, started, now):
+    path = details.get("transcriptPath")
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            stat = os.fstat(handle.fileno())
+            cursor = details.get("rolloutCursor", {})
+            if cursor.get("identity") != [stat.st_dev, stat.st_ino] or cursor.get("offset", 0) > stat.st_size:
+                offset = max(0, stat.st_size - 512 * 1024)
+                cursor = {"identity": [stat.st_dev, stat.st_ino], "offset": offset, "discard": offset > 0}
+            handle.seek(cursor["offset"])
+            data = handle.read(2 * 1024 * 1024)
+        consumed = 0
+        result = None
+        fragments = data.split(b"\n")
+        for line in fragments[:-1]:
+            consumed += len(line) + 1
+            if cursor.get("discard"):
+                cursor["discard"] = False
+                continue
+            try:
+                value = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            payload = value.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("type")
+            candidate = identifier(payload.get("turn_id"))
+            if candidate:
+                cursor["turnKey"] = candidate
+            if value.get("type") != "event_msg" or kind not in ("task_complete", "turn_complete", "turn_aborted"):
+                continue
+            target = details.get("turnKey")
+            if target and cursor.get("turnKey") != target:
+                continue
+            at = event_time(value.get("timestamp")) or event_time(payload.get("completed_at"))
+            if at is None or at < started or (not target and at < details["pendingStop"] - 2):
+                continue
+            result = ("ended" if kind == "turn_aborted" else "completed", min(at, now))
+        # 超出预算的行继续按字节跳过, 不保存对话片段, 后续终态仍可读取
+        if not consumed and len(data) == 2 * 1024 * 1024:
+            consumed = len(data)
+            cursor["discard"] = True
+        cursor["offset"] += consumed
+        details["rolloutCursor"] = cursor
+        return result
+    except OSError:
+        return None
+
+
+def reconcile(db, now=None):
+    now = time.time() if now is None else now
+    rows = db.execute("SELECT t.id,t.provider,t.state,t.pid,t.birth,t.updated,t.started,d.payload FROM tasks t "
+                      "LEFT JOIN details d ON d.id=t.id WHERE t.state IN ('running','waiting','unknown')").fetchall()
+    # 文件和进程检查在写事务外执行, 不阻塞同时到达的 Hook
+    rows.sort(key=lambda row: json.loads(row[7] or "{}").get("terminalCheckedAt", 0))
+    scanned = 0
+    for task_id, provider, state, pid, birth, updated, started, raw in rows:
+        details = json.loads(raw) if raw else {}
+        if details.get("observedAt") != updated:
+            details = {}
+        next_state = state
+        terminal_at = updated
+        pending = details.get("pendingStop")
+        if pending is not None and scanned < 8:
+            scanned += 1
+            details["terminalCheckedAt"] = now
+            terminal = ("completed", pending) if provider == "claude" and now - pending >= 2 else codex_terminal(details, started, now) if provider == "codex" else None
+            if terminal:
+                next_state, terminal_at = terminal
+                details.pop("pendingStop", None)
+                details.pop("rolloutCursor", None)
+                details["waits"] = {}
+                if details.get("activeSubagentCount") is not None:
+                    details["activeSubagentCount"] = 0
+                if details.get("turnKey"):
+                    details["endedTurns"] = (details.get("endedTurns", []) + [details["turnKey"]])[-16:]
+                details["observedAt"] = terminal_at
+            elif now - pending >= 10:
+                next_state = "ended" if details.get("sessionEnded") else "unknown"
+                if next_state == "ended":
+                    details.pop("pendingStop", None)
+                    terminal_at = pending
+                    details["observedAt"] = terminal_at
+        elif state in ("running", "waiting") and pending is None:
             identity = process_identity(pid) if pid else None
-            # 消失的进程只标记失联, 不伪造任务完成
             if (pid and (not identity or identity[1] != birth)) or (not pid and now - updated > 600):
-                db.execute("UPDATE tasks SET state='unknown' WHERE id=?", (task_id,))
+                next_state = "unknown"
+        if next_state == state and pending is None:
+            continue
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT updated FROM tasks WHERE id=?", (task_id,)).fetchone()
+            current_details_row = db.execute("SELECT payload FROM details WHERE id=?", (task_id,)).fetchone()
+            if not current or current[0] != updated or (current_details_row[0] if current_details_row else None) != raw:
+                continue
+            if next_state != state:
+                details["stateChangedAt"] = terminal_at
+                db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (next_state, terminal_at, task_id))
                 db.execute("UPDATE meta SET revision=revision+1")
+                if next_state in ("completed", "ended"):
+                    db.execute("DELETE FROM agents WHERE parent=?", (task_id,))
+            if pending is not None:
+                db.execute("INSERT OR REPLACE INTO details VALUES(?,?)", (task_id, json.dumps(details)))
+
+
+def pending_stop_delay(frame):
+    # 新 Stop 的确认期间才短暂加快检查, 未确认的旧记录随保活重查
+    now = time.time()
+    return 1 if any(t.get("eventName") == "Stop" and t["state"] in ("running", "waiting", "unknown") and now - t["updatedAt"] < 10 for t in frame["tasks"]) else 60
 
 
 def snapshot(db):
@@ -197,42 +414,106 @@ def current_details(payload, updated):
     # 旧采集器仍能写原任务表, 附加字段只在同一笔更新时有效
     if details.get("observedAt") != updated:
         return {}
-    return {key: details[key] for key in ("eventName", "toolName", "activeSubagentCount") if key in details}
+    result = {key: details[key] for key in ("eventName", "toolName", "activeSubagentCount", "effort", "stateChangedAt") if key in details}
+    if details.get("pendingStop") is not None:
+        result["eventName"] = "Stop"
+    return result
 
 
-def model_name(payload, provider):
+def partial_object(text, offset=0, depth=0):
+    # 只保留顺序解析完成的字段, 不在指令正文中搜索伪造的来源标记
+    if depth > 8:
+        return {}, offset
+    decoder = json.JSONDecoder()
+    result = {}
+    offset += 1
+    try:
+        while offset < len(text):
+            while offset < len(text) and text[offset].isspace():
+                offset += 1
+            if offset < len(text) and text[offset] == "}":
+                return result, offset + 1
+            key, end = decoder.raw_decode(text, offset)
+            if not isinstance(key, str):
+                break
+            offset = end
+            while offset < len(text) and text[offset].isspace():
+                offset += 1
+            if offset >= len(text) or text[offset] != ":":
+                break
+            offset += 1
+            while offset < len(text) and text[offset].isspace():
+                offset += 1
+            if offset < len(text) and text[offset] == "{":
+                value, offset = partial_object(text, offset, depth + 1)
+            else:
+                value, offset = decoder.raw_decode(text, offset)
+            result[key] = value
+            while offset < len(text) and text[offset].isspace():
+                offset += 1
+            if offset < len(text) and text[offset] == ",":
+                offset += 1
+                continue
+            if offset < len(text) and text[offset] == "}":
+                return result, offset + 1
+            break
+    except (ValueError, IndexError):
+        pass
+    return result, len(text)
+
+
+def model_metadata(payload, provider):
     def valid(value):
         return value if isinstance(value, str) and 0 < len(value) <= 100 and value.isprintable() else None
-    model = valid(payload.get("model"))
-    if model:
-        return model
-    transcript = payload.get("transcript_path")
-    if not isinstance(transcript, str):
-        return None
-    home = Path(os.environ.get("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR", str(Path.home() / ("." + provider)))).expanduser().resolve()
-    path = Path(transcript).expanduser().resolve()
-    folders = ("sessions", "archived_sessions") if provider == "codex" else ("projects",)
-    if not any(path.is_relative_to(home / folder) for folder in folders):
-        return None
+    result = {"model": valid(payload.get("model")), "effort": valid(payload.get("effort")),
+              "reviewer": payload.get("approval_reviewer")}
+    transcript = transcript_path(payload, provider)
+    if not transcript:
+        return result
     try:
-        # 只从有界尾部提取模型标识, 对话与工具内容不保存也不传输
-        with path.open("rb") as source:
+        with open(transcript, "rb") as source:
+            if provider == "codex":
+                first = source.read(256 * 1024).split(b"\n", 1)[0].decode("utf-8", errors="ignore")
+                header, _ = partial_object(first) if first.startswith("{") else ({}, 0)
+                metadata = header.get("payload", {}) if header.get("type") == "session_meta" else {}
+                origin = metadata.get("source") if isinstance(metadata, dict) else None
+                child = origin.get("subagent") if isinstance(origin, dict) else None
+                if isinstance(child, dict):
+                    result["ignored"] = child.get("other") == "guardian"
+                    spawn = child.get("thread_spawn", {})
+                    if isinstance(spawn, dict):
+                        result["parentSession"] = valid(spawn.get("parent_thread_id"))
+            budget = 8 * 1024 * 1024 if provider == "codex" and payload.get("hook_event_name") == "PermissionRequest" else 512 * 1024
             size = source.seek(0, os.SEEK_END)
-            source.seek(max(0, size - 131072))
-            if size > 131072:
-                source.readline(131072)
-            lines = source.read(131072).splitlines()
-        for line in reversed(lines[-100:]):
+            source.seek(max(0, size - budget))
+            data = source.read(budget)
+            if size > budget:
+                data = data.partition(b"\n")[2]
+            lines = data.splitlines()
+        for line in reversed(lines):
             try:
                 value = json.loads(line)
-                detail = value.get("payload") if value.get("type") == "turn_context" else value.get("message") if value.get("type") == "assistant" else None
-                if isinstance(detail, dict) and valid(detail.get("model")):
-                    return detail["model"]
+                if not isinstance(value, dict):
+                    continue
+                detail = value.get("payload") if value.get("type") == "turn_context" else value.get("message") if provider == "claude" and value.get("type") == "assistant" else None
+                if not isinstance(detail, dict):
+                    continue
+                if provider == "codex" and payload.get("turn_id") and detail.get("turn_id") != payload["turn_id"]:
+                    continue
+                result["model"] = result["model"] or valid(detail.get("model"))
+                result["effort"] = valid(detail.get("effort")) or result["effort"]
+                result["reviewer"] = detail.get("approvals_reviewer", result["reviewer"])
+                result["rootTurn"] = valid(detail.get("root_turn_id"))
+                break
             except (ValueError, AttributeError):
                 continue
     except OSError:
         pass
-    return None
+    return result
+
+
+def model_name(payload, provider):
+    return model_metadata(payload, provider).get("model")
 
 
 class ChangeWatcher:
@@ -277,12 +558,15 @@ def stream(root, db):
     try:
         revision = None
         heartbeat = 0.0
+        next_reconcile = 0.0
         pending = b""
         while True:
             now = time.monotonic()
-            if now >= heartbeat:
+            if now >= next_reconcile:
                 reconcile(db)
+                next_reconcile = now + 60
             frame = snapshot(db)
+            next_reconcile = min(next_reconcile, now + pending_stop_delay(frame))
             if frame["revision"] != revision or now >= heartbeat:
                 data = json.dumps(frame, separators=(",", ":")).encode() + b"\n"
                 if len(data) > LIMIT:
@@ -291,7 +575,7 @@ def stream(root, db):
                 sys.stdout.buffer.flush()
                 revision = frame["revision"]
                 heartbeat = now + 60
-            ready, _, _ = select.select([watcher.descriptor, sys.stdin.fileno()], [], [], max(0, heartbeat - time.monotonic()))
+            ready, _, _ = select.select([watcher.descriptor, sys.stdin.fileno()], [], [], max(0, min(heartbeat, next_reconcile) - time.monotonic()))
             if watcher.descriptor in ready:
                 watcher.drain()
             if sys.stdin.fileno() in ready:
@@ -423,8 +707,8 @@ def configure(args):
             if rpc:
                 result = rpc.request("initialize", dict(clientInfo=dict(name="codex_bar", title="CodexBar", version="1.0.0")))
                 match = re.match(r"[^/]+/(\d+)\.(\d+)\.(\d+)", result.get("userAgent", ""))
-                if not match or tuple(map(int, match.groups())) < (0, 145, 0):
-                    raise RuntimeError("实时 Hook 需要 Codex 0.145.0 或更新版本")
+                if not match or tuple(map(int, match.groups())) < (0, 150, 0):
+                    raise RuntimeError("实时 Hook 需要 Codex 0.150.0 或更新版本")
                 rpc.process.stdin.write(b'{"method":"initialized"}\n')
                 rpc.process.stdin.flush()
                 features = rpc.request("config/read", {})["config"].get("features") or {}
@@ -446,13 +730,13 @@ def configure(args):
                            if hook.get("command") == command and hook.get("sourcePath") == str(config)]
                 trust = {hook["key"]: {"trusted_hash": hook["currentHash"]} for hook in managed
                          if hook.get("key") and hook.get("currentHash")}
-                if len(managed) != len(EVENTS) or len(trust) != len(EVENTS):
+                if len(managed) != len(events_for(provider)) or len(trust) != len(events_for(provider)):
                     raise RuntimeError("Codex 未识别全部实时 Hook, 配置已保留供检查")
                 rpc.request("config/batchWrite", dict(edits=[dict(keyPath="hooks.state", value=trust, mergeStrategy="upsert")]))
                 verified = rpc.request("hooks/list", dict(cwds=[str(Path.home())]))
                 installed = [hook for entry in verified["data"] for hook in entry["hooks"]
                              if hook.get("command") == command and hook.get("sourcePath") == str(config)]
-                if len(installed) != len(EVENTS) or any(not hook.get("enabled") or hook.get("trustStatus") != "trusted" for hook in installed):
+                if len(installed) != len(events_for(provider)) or any(not hook.get("enabled") or hook.get("trustStatus") != "trusted" for hook in installed):
                     raise RuntimeError("Codex 实时 Hook 未通过信任校验")
         finally:
             if rpc:

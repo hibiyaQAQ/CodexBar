@@ -53,3 +53,7 @@ Collector/.env
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# 本地测试覆盖率产物
+*.profraw
+*.profdata

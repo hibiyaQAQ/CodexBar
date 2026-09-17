@@ -93,8 +93,8 @@ bash Scripts/build-local.sh
 
 - macOS 15.0 or later
 - [Codex CLI](https://github.com/openai/codex) installed and signed in, or ChatGPT App or Codex App with bundled Codex installed
-- The running Codex version must be `0.143.0` or later
-- Live tasks and other Hook features require the running Codex version to be `0.145.0` or later
+- The running Codex version must be `0.145.0` or later
+- Live tasks and other Hook features require the running Codex version to be `0.150.0` or later
 - Log collection requires Python 3.9 or later, with no extra packages
 - Claude quotas require matching records in local client caches
 

@@ -38,13 +38,17 @@ class ActivityTests(unittest.TestCase):
         self.event("UserPromptSubmit", provider="claude")
         self.event("PermissionRequest", now=1001)
         states = {row["provider"]: row["state"] for row in activity.snapshot(self.db)["tasks"]}
-        self.assertEqual(states, {"codex": "waiting", "claude": "running"})
+        self.assertEqual(states, {"codex": "unknown", "claude": "running"})
         self.event("PostToolUse", now=1002)
         self.event("SubagentStop", now=1003)
         self.event("Stop", now=1004)
         rows = activity.snapshot(self.db)["tasks"]
-        self.assertEqual(rows[0]["state"], "completed")
+        self.assertEqual(rows[0]["state"], "running")
+        self.assertEqual(rows[0]["eventName"], "Stop")
         self.assertEqual(rows[0]["startedAt"], 1000)
+        activity.reconcile(self.db, now=1015)
+        codex = next(row for row in activity.snapshot(self.db)["tasks"] if row["provider"] == "codex")
+        self.assertEqual(codex["state"], "unknown")
 
     def test_idle_session_end_does_not_create_termination(self):
         for provider in ("codex", "claude"):
@@ -57,6 +61,7 @@ class ActivityTests(unittest.TestCase):
     def test_terminal_events_do_not_overwrite_completed_task(self):
         self.event("UserPromptSubmit", provider="claude")
         self.event("Stop", provider="claude", now=1020)
+        activity.reconcile(self.db, now=1022)
         completed = activity.snapshot(self.db)
         self.event("Stop", provider="claude", now=1030)
         self.event("SessionEnd", provider="claude", now=1100)
@@ -71,6 +76,7 @@ class ActivityTests(unittest.TestCase):
                 with self.db:
                     self.db.execute("UPDATE tasks SET state=?", (state,))
                 self.event("SessionEnd", now=1020)
+                activity.reconcile(self.db, now=1030)
                 task = activity.snapshot(self.db)["tasks"][0]
                 self.assertEqual(task["state"], "ended")
                 self.assertEqual(task["startedAt"], 1000)
@@ -141,9 +147,9 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(activity.snapshot(self.db)["revision"], 0)
 
     def test_claude_tool_and_compaction_phases(self):
-        for event in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PreCompact", "PostCompact"):
-            activity.record(self.db, dict(hook_event_name=event, session_id="session", tool_name="Bash",
-                                         tool_input={"command": "private-command"}, error="private-error"), "claude", 1000)
+        for index, event in enumerate(("PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PreCompact", "PostCompact")):
+            activity.record(self.db, dict(hook_event_name=event, session_id=event, tool_name="Bash",
+                                         tool_input={"command": "private-command"}, error="private-error"), "claude", 1000 + index)
             task = activity.snapshot(self.db)["tasks"][0]
             self.assertEqual(task["eventName"], event)
             self.assertEqual(task["toolName"], "Bash")
@@ -159,6 +165,7 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(task["activeSubagentCount"], 1)
         self.assertEqual(task["eventName"], "SubagentStop")
         self.event("Stop", provider="claude", now=1002)
+        activity.reconcile(self.db, now=1004)
         self.assertEqual(activity.snapshot(self.db)["tasks"][0]["activeSubagentCount"], 0)
 
     def test_old_protocol_without_details_remains_readable(self):
@@ -184,6 +191,140 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(first["epoch"], second["epoch"])
         self.assertEqual(first["revision"], second["revision"])
         self.assertEqual(first["tasks"], second["tasks"])
+
+    def emit(self, event, now=1000, provider="claude", **fields):
+        activity.record(self.db, dict(hook_event_name=event, session_id="session", cwd="/project", **fields), provider, now)
+
+    def task(self):
+        return activity.snapshot(self.db)["tasks"][0]
+
+    def test_parallel_agents_only_resolve_their_own_approval(self):
+        self.emit("UserPromptSubmit", model="parent-model")
+        self.emit("SubagentStart", 1001, agent_id="a", model="child-model")
+        self.emit("SubagentStart", 1002, agent_id="b")
+        self.emit("PermissionRequest", 1003, agent_id="a", tool_use_id="one", tool_name="Bash")
+        self.emit("PermissionRequest", 1004, agent_id="b", tool_use_id="two", tool_name="Write")
+        first_wait = self.task()["stateChangedAt"]
+        self.emit("PostToolUse", 1005, tool_use_id="parent-tool")
+        self.assertEqual(self.task()["stateChangedAt"], first_wait)
+        self.assertEqual(self.task()["state"], "waiting")
+        self.emit("SubagentStop", 1006, agent_id="a")
+        self.assertEqual(self.task()["state"], "waiting")
+        self.assertEqual(self.task()["toolName"], "Write")
+        self.assertEqual(self.task()["stateChangedAt"], 1004)
+        self.emit("PostToolUse", 1007, agent_id="b", tool_use_id="two")
+        self.assertEqual(self.task()["state"], "running")
+        self.assertEqual(self.task()["modelName"], "parent-model")
+
+    def test_subagent_stop_and_interrupt_do_not_end_parent(self):
+        for terminal in ("Stop", "StopFailure", "PostToolUseFailure"):
+            self.emit("UserPromptSubmit")
+            self.emit("SubagentStart", 1001, agent_id="a")
+            self.emit(terminal, 1002, agent_id="a", is_interrupt=True)
+            self.assertEqual(self.task()["state"], "running")
+            self.assertEqual(self.task()["activeSubagentCount"], 0)
+            with self.db:
+                self.db.execute("DELETE FROM tasks")
+
+    def test_claude_failure_or_interruption_is_not_completion(self):
+        self.emit("UserPromptSubmit")
+        self.emit("StopFailure", 1001, error="rate_limit", error_details="private")
+        self.assertEqual(self.task()["state"], "ended")
+        self.assertNotIn("private", json.dumps(activity.snapshot(self.db)))
+        self.emit("UserPromptSubmit", 1002)
+        self.emit("PostToolUseFailure", 1003, is_interrupt=True)
+        self.assertEqual(self.task()["state"], "ended")
+
+    def test_claude_stop_continuation_cancels_pending_completion(self):
+        self.emit("UserPromptSubmit")
+        self.emit("Stop", 1001)
+        self.emit("PreToolUse", 1002)
+        activity.reconcile(self.db, now=1004)
+        self.assertEqual(self.task()["state"], "running")
+        self.emit("Stop", 1005, stop_hook_active=True)
+        activity.reconcile(self.db, now=1006)
+        self.assertEqual(self.task()["state"], "running")
+        activity.reconcile(self.db, now=1007)
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["startedAt"], 1000)
+
+    def test_old_codex_turn_and_old_subagent_cannot_mutate_new_task(self):
+        self.emit("UserPromptSubmit", provider="codex", turn_id="old", model="old-model")
+        self.emit("SubagentStart", 1001, provider="codex", turn_id="old", agent_id="old-agent")
+        self.emit("UserPromptSubmit", 1002, provider="codex", turn_id="new", model="new-model")
+        before = activity.snapshot(self.db)
+        self.emit("Stop", 1003, provider="codex", turn_id="old", model="old-model")
+        self.emit("PostToolUse", 1004, provider="codex", agent_id="old-agent")
+        self.emit("UserPromptSubmit", 1005, provider="codex", turn_id="old")
+        self.assertEqual(activity.snapshot(self.db)["tasks"], before["tasks"])
+        self.assertEqual(activity.snapshot(self.db)["revision"], before["revision"])
+
+    def test_codex_child_thread_uses_parent_turn_and_reviewer(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"CODEX_HOME": home}):
+            path = Path(home) / "sessions/child.jsonl"
+            path.parent.mkdir()
+            header = {"type": "session_meta", "payload": {"id": "child-session", "source": {"subagent": {"thread_spawn": {"parent_thread_id": "session"}}}, "instructions": "x" * 300000}}
+            context = {"type": "turn_context", "payload": {"turn_id": "child-turn", "root_turn_id": "root-turn", "approvals_reviewer": "user", "model": "child-model"}}
+            path.write_text(json.dumps(header) + "\n" + json.dumps(context) + "\n")
+            self.emit("UserPromptSubmit", provider="codex", turn_id="root-turn", model="parent-model")
+            self.emit("SubagentStart", 1001, provider="codex", turn_id="root-turn", agent_id="child-session")
+            payload = dict(hook_event_name="PermissionRequest", session_id="child-session", turn_id="child-turn", transcript_path=str(path), tool_name="Bash")
+            activity.record(self.db, payload, "codex", 1002)
+            self.assertEqual(len(activity.snapshot(self.db)["tasks"]), 1)
+            self.assertEqual(self.task()["state"], "waiting")
+            self.assertEqual(self.task()["modelName"], "parent-model")
+            self.emit("PostToolUse", 1003, provider="codex", turn_id="root-turn")
+            self.assertEqual(self.task()["state"], "waiting")
+            self.emit("UserPromptSubmit", 1004, provider="codex", turn_id="next-turn")
+            before = activity.snapshot(self.db)
+            activity.record(self.db, {**payload, "hook_event_name": "PostToolUse"}, "codex", 1005)
+            self.assertEqual(activity.snapshot(self.db)["tasks"], before["tasks"])
+
+    def test_codex_guardian_approval_is_not_user_waiting(self):
+        self.emit("UserPromptSubmit", provider="codex")
+        self.emit("PermissionRequest", 1001, provider="codex", approval_reviewer="guardian")
+        self.assertEqual(self.task()["state"], "running")
+
+    def test_claude_normal_exit_after_stop_remains_completed(self):
+        self.emit("UserPromptSubmit")
+        self.emit("Stop", 1001)
+        self.emit("SessionEnd", 1001.5)
+        activity.reconcile(self.db, now=1004)
+        self.assertEqual(self.task()["state"], "completed")
+        self.assertEqual(self.task()["updatedAt"], 1001)
+
+    def test_codex_stop_requires_matching_rollout_terminal(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"CODEX_HOME": home}):
+            path = Path(home) / "sessions/test.jsonl"
+            path.parent.mkdir()
+            path.write_text(json.dumps({"type": "event_msg", "timestamp": "1970-01-01T00:16:42Z", "payload": {"type": "task_complete", "turn_id": "old"}}) + "\n")
+            self.emit("UserPromptSubmit", provider="codex", turn_id="current")
+            self.emit("Stop", 1001, provider="codex", turn_id="current", transcript_path=str(path))
+            activity.reconcile(self.db, now=1002)
+            self.assertEqual(self.task()["state"], "running")
+            with path.open("a") as f:
+                f.write(json.dumps({"type": "event_msg", "timestamp": "1970-01-01T00:16:43Z", "payload": {"type": "task_complete", "turn_id": "current"}}) + "\n")
+            activity.reconcile(self.db, now=1004)
+            self.assertEqual(self.task()["state"], "completed")
+            self.assertNotIn("transcriptPath", json.dumps(activity.snapshot(self.db)))
+
+    def test_oversized_partial_rollout_does_not_block_later_terminal(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"CODEX_HOME": home}):
+            path = Path(home) / "sessions/test.jsonl"
+            path.parent.mkdir()
+            path.write_bytes(b'{"type":"response_item","payload":{"text":"' + b'x' * (3 * 1024 * 1024))
+            self.emit("UserPromptSubmit", provider="codex", turn_id="current")
+            self.emit("Stop", 1001, provider="codex", turn_id="current", transcript_path=str(path))
+            activity.reconcile(self.db, now=1002)
+            self.assertEqual(self.task()["state"], "running")
+            with path.open("ab") as f:
+                f.write(b'x' * (3 * 1024 * 1024) + b'"}}\n')
+                f.write(json.dumps({"type": "event_msg", "timestamp": "1970-01-01T00:16:43Z", "payload": {"type": "turn_aborted", "turn_id": "current"}}).encode() + b"\n")
+            for now in range(1004, 1009):
+                activity.reconcile(self.db, now=now)
+            self.assertEqual(self.task()["state"], "ended")
+            raw = self.db.execute("SELECT payload FROM details").fetchone()[0]
+            self.assertNotIn("xxxxxxxxxx", raw)
 
     def test_push_after_commit_idle_and_disconnect(self):
         with tempfile.TemporaryDirectory() as home:

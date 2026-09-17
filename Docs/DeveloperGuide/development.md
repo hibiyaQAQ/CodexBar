@@ -4,7 +4,7 @@
 
 ## 环境与构建
 
-需要 macOS 15+、Xcode、Swift 6、`swiftformat` 和 `swiftlint`。唯一 scheme 为 `CodexBar`，包含 App 与 `CodexBarHelper` 两个 target，没有 XCTest target。
+需要 macOS 15+、Xcode、Swift 6、`swiftformat` 和 `swiftlint`。唯一 scheme 为 `CodexBar`，包含 App、`CodexBarHelper` 和无宿主 Swift Testing target `CodexBarTests`。
 
 ```bash
 xcodebuild -project CodexBar.xcodeproj -scheme CodexBar -destination 'generic/platform=macOS' build
@@ -153,3 +153,21 @@ defaults write io.github.yatotm.codexbar.build signingIdentity -string "证书 S
 需要保留电源功能时，使用已配置开发签名的 Mac 构建，再运行 `Scripts/package-release.py --keychain-account yatotm.CodexBar`。打包器验证主 App 与电源组件的签名身份及双架构，直接通过钥匙串签署 Sparkle 更新，不导出私钥。
 
 确认发布后，推送对应提交，并用 `Scripts/publish-release.py` 创建附注 tag、上传附件和公开 Release。普通推送只运行验证。GitHub 托管构建未配置开发签名时仍生成临时签名包，其电源功能不可用，不能替代本机的开发签名产物。
+
+## 隔离单元测试
+
+`bash Scripts/test-local.sh` 在临时工程副本中运行无宿主 Swift Testing，构建输出位于 `~/Library/Caches/CodexBar/TestBuild`，可用 `CODEXBAR_TEST_OUTPUT` 指定。测试数据和偏好使用独立临时目录与 suite，不触发真实服务。原多机器回归入口保持不变；Bark 使用 `python3 -B -m unittest discover -s Tests -p 'test_issue_notification.py' -v` 做模拟验证，不发送真实通知。
+
+## GitHub Issue 的 Bark 通知
+
+工作流仅处理本仓库的新 Issue、他人 Issue 评论和手动测试，跳过本人事件及 PR 评论。它不在 Mac 后台运行，也不改变应用通知设置。
+
+在仓库 `Settings > Secrets and variables > Actions` 配置：
+
+| Secret | 内容 |
+| --- | --- |
+| `BARK_TOKEN` | Bark 设备密钥，不是完整推送链接，必填 |
+| `BARK_SERVER_URL` | 自建服务器的 HTTPS 根地址，可选；默认 `https://api.day.app` |
+| `BARK_ICON_URL` | 通知图标的 HTTPS 地址，可选 |
+
+`SELF_LOGIN` 仓库变量可指定需要排除的账号，默认使用仓库所有者。缺少设备密钥时跳过发送；配置完成并推送工作流后，可在 Actions 手动运行 `Issue notification` 验证。发送内容为 Issue 标题和链接，设备密钥通过 HTTPS POST 请求体传送，不写入 URL 或日志。

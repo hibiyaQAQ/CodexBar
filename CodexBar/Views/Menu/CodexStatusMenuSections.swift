@@ -64,21 +64,15 @@ struct AccountCard: View {
 
     private static func planBadgeTint(for plan: String, colorScheme: ColorScheme) -> Color {
         let normalizedPlan = plan.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let rule = planTintRules.first { rule in
+        let colors = planTintRules.first { rule in
             rule.keywords.contains { normalizedPlan.contains($0) }
-        }
-        let hex = if colorScheme == .dark {
-            rule?.colors.dark ?? 0x67E8F9
-        } else {
-            rule?.colors.light ?? 0x0E7490
-        }
-        return Color(hex: hex)
+        }?.colors ?? (light: 0x0E7490, dark: 0x67E8F9)
+        return Color(hex: colorScheme == .dark ? colors.dark : colors.light)
     }
 
     private static let planTintRules: [(keywords: [String], colors: (light: Int, dark: Int))] = [
         (["enterprise"], (0x52677F, 0xA7AFBA)),
-        (["team", "business"], (0x147B82, 0x82B3B5)),
-        (["pro"], (0x147B82, 0x82B3B5)),
+        (["team", "business", "pro"], (0x147B82, 0x82B3B5)),
         (["plus"], (0x256FA3, 0x89A9C2)),
         (["edu"], (0x9B5F12, 0xC7A96B)),
         (["free"], (0x167A5E, 0x7FB5A4))
@@ -183,11 +177,16 @@ struct QuotaLimitsSection: View {
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .layoutPriority(-1)
 
                 Spacer(minLength: 8)
 
-                if showsPrimaryMetadata, let credits, let value = creditsDisplayValue(credits) {
-                    creditsBalance(value: value, credits: credits)
+                if showsPrimaryMetadata, let credits {
+                    let value = creditsDisplayValue(credits)
+                    metadataCapsule(
+                        String(localized: "quota.credits.value", defaultValue: "\(value)"),
+                        tint: credits.unlimited || credits.hasCredits ? .green : .orange
+                    )
                 }
 
                 if showsPrimaryMetadata, let resetCreditsAvailableCount, resetCreditsAvailableCount > 0 {
@@ -203,36 +202,13 @@ struct QuotaLimitsSection: View {
         }
     }
 
-    @ViewBuilder
-    private func creditsBalance(value: String, credits: RateLimitCreditsSnapshot) -> some View {
-        let capsule = metadataCapsule(String(localized: "quota.credits.value", defaultValue: "\(value)"))
-
-        if let helpText = creditsHelpText(value: value, credits: credits) {
-            capsule.help(helpText)
-        } else {
-            capsule
-        }
-    }
-
-    private func creditsDisplayValue(_ credits: RateLimitCreditsSnapshot) -> String? {
+    private func creditsDisplayValue(_ credits: RateLimitCreditsSnapshot) -> String {
         if credits.unlimited {
             return String(localized: "quota.value.unlimited")
         }
 
-        if let balance = normalizedCreditsBalance(credits.balance) {
-            return compactCreditsBalance(balance)
-        }
-
-        return credits.hasCredits ? String(localized: "common.status.available") : nil
-    }
-
-    private func creditsHelpText(value: String, credits: RateLimitCreditsSnapshot) -> String? {
-        guard value.hasSuffix("K") || value.hasSuffix("M"),
-              let balance = normalizedCreditsBalance(credits.balance) else {
-            return nil
-        }
-
-        return balance
+        return normalizedCreditsBalance(credits.balance)
+            ?? String(localized: "common.status.available")
     }
 
     private func normalizedCreditsBalance(_ balance: String?) -> String? {
@@ -240,35 +216,15 @@ struct QuotaLimitsSection: View {
             return nil
         }
 
-        return balance
-    }
-
-    private func compactCreditsBalance(_ balance: String) -> String {
-        guard let amount = Double(balance), amount.isFinite else {
-            return truncatedCreditsBalance(balance)
-        }
-
-        let magnitude = abs(amount)
-        guard magnitude >= Self.compactCreditsThreshold else {
-            return truncatedCreditsBalance(balance)
-        }
-
-        guard let unit = Self.compactCreditsUnits.first(where: { magnitude >= $0.divisor }),
-              let formattedAmount = Self.compactCreditsFormatter.string(
-                  from: NSNumber(value: amount / unit.divisor)
-              ) else {
-            return truncatedCreditsBalance(balance)
-        }
-
-        return truncatedCreditsBalance("\(formattedAmount)\(unit.suffix)")
-    }
-
-    private func truncatedCreditsBalance(_ balance: String) -> String {
-        guard balance.count > Self.maximumFallbackCreditsCharacters else {
+        guard let value = Double(balance), value.isFinite else {
             return balance
         }
 
-        return "\(balance.prefix(Self.maximumFallbackCreditsCharacters - 3))..."
+        if value > 0, value < 1 {
+            return "< 1"
+        }
+
+        return value.rounded(.towardZero).formatted(.number.grouping(.never).precision(.fractionLength(0)))
     }
 
     private func resetCreditsButton(count: Int) -> some View {
@@ -286,36 +242,17 @@ struct QuotaLimitsSection: View {
         .buttonStyle(.plain)
     }
 
-    private func metadataCapsule(_ text: String) -> some View {
+    private func metadataCapsule(_ text: String, tint: Color = .green) -> some View {
         Text(text)
             .font(.caption2.weight(.medium))
             .monospacedDigit()
-            .foregroundStyle(.green)
+            .foregroundStyle(tint)
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .liquidGlassCapsule(tint: .green)
+            .liquidGlassCapsule(tint: tint)
     }
-
-    private static let compactCreditsThreshold = 10000.0
-    private static let maximumFallbackCreditsCharacters = 12
-    private static let compactCreditsUnits: [(divisor: Double, suffix: String)] = [
-        (1000000000000, "T"),
-        (1000000000, "B"),
-        (1000000, "M"),
-        (1000, "K")
-    ]
-
-    private static let compactCreditsFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.numberStyle = .decimal
-        formatter.usesGroupingSeparator = false
-        formatter.minimumFractionDigits = 0
-        formatter.maximumFractionDigits = 1
-        return formatter
-    }()
 }
 
 /// 底部更新时间行, 同时承载 Sparkle 被动更新提示

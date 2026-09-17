@@ -32,6 +32,11 @@ jobs:
           bash Scripts/verify-usage-center.sh
           python3 -B -m unittest discover -s Tests -p 'test_release.py' -v
           python3 -B -m unittest discover -s Tests -p 'test_fork_migration.py' -v
+          python3 -B -m unittest discover -s Tests -p 'test_issue_notification.py' -v
+      - name: Run Swift unit tests
+        env:
+          CODEXBAR_TEST_OUTPUT: ${{ runner.temp }}/codexbar-tests
+        run: bash Scripts/test-local.sh
       - name: Build app and helper
         env:
           CODEXBAR_LOCAL_OUTPUT: ${{ runner.temp }}/codexbar-build

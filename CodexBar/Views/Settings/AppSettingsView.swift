@@ -13,6 +13,8 @@ struct AppSettingsView: View {
     @ObservedObject var globalHotKeySettings: GlobalHotKeySettings
     @ObservedObject var menuBarQuotaSettings: MenuBarQuotaSettings
     @ObservedObject var mainPanelSettings: MainPanelSettings
+    @ObservedObject var taskGlowSettings: TaskGlowSettings
+    let activityPresentation: ActivityPresentationModel
     @ObservedObject var notificationSettings: NotificationSettings
     @ObservedObject var autoResetSettings: AutoResetSettings
     @ObservedObject var keepAliveController: KeepAliveController
@@ -254,6 +256,8 @@ private extension AppSettingsView {
                 mainPanelLayoutRow
                 LiquidGlassDivider()
                 mainPanelEntranceAnimationsRow
+                LiquidGlassDivider()
+                TaskGlowSettingsRow(settings: taskGlowSettings, codexHookSettings: codexHookSettings, activityPresentation: activityPresentation)
                 LiquidGlassDivider()
                 launchAtLoginRow
                 LiquidGlassDivider()

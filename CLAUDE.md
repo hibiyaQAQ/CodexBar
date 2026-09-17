@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 CodexBar 是一个 macOS 菜单栏应用，以 `LSUIElement` 方式运行，没有 Dock 图标，展示本机 Codex 的账号状态、额度、Token 用量、实时任务和工作流统计。技术栈为 Swift 6 + SwiftUI + AppKit + MVVM，唯一外部依赖是 Sparkle `2.9.6+`（SwiftPM）。最低系统版本为 macOS `15.0`
 
-Xcode 工程有两个 target：主 App `CodexBar` 和随 App 嵌入的 root helper `CodexBarHelper`（command-line tool + LaunchDaemon）。**没有测试 target**，验证依靠构建通过和实际运行。
+Xcode 工程有三个 target：主 App `CodexBar`、随 App 嵌入的 root helper `CodexBarHelper` 和无宿主 Swift Testing target `CodexBarTests`。
 
 App Sandbox 未开启，需要启动本机 `codex` 进程、读取用户 Codex 登录状态、写入用户级 Hook 配置。本 fork 已移除 CloudKit 服务和 entitlement。
 
@@ -305,7 +305,7 @@ Hook 子进程按天写入 `~/Library/Application Support/CodexBar-yatotm/HookEv
 
 - 只识别并移除 command 同时包含当前 CodexBar 可执行路径与 `--hook-event` 的 handler，必须保留用户已有 Hook 以及其他 App 的 Hook 和同事件下的其他 handler
 - 每个 `CodexHookEvent.allCases` 事件追加一个独立 group，handler 超时从 `WorkflowHookEventRecorder.hookTimeoutSeconds(for:)` 取得；新增事件时不得复制一份超时常量
-- 启用和校验 Hook 前要求当前 app-server 握手版本至少为 `0.145.0`；必须检查 `readyConnectionInfo()` 返回的实际连接版本，不能用磁盘版本代替，否则升级后尚未重连的旧进程会被误判为可用
+- 启用和校验 Hook 前要求当前 app-server 握手版本至少为 `0.150.0`；必须检查 `readyConnectionInfo()` 返回的实际连接版本，不能用磁盘版本代替，否则升级后尚未重连的旧进程会被误判为可用
 - 写入前通过 app-server `config/read` 确认全局未禁用 Hook，写入后用 `hooks/list` 验证；两处读取共用 `readGlobalHookDisabled`，开关流程与校验流程对“全局禁用”的判断不会分叉
 - 读取失败（I/O 或 JSON 格式错误）不提供 Hook 装没装的信息，必须保留上次已知值，不能当成用户关闭了 Hook
 - `isEnabled` 表示当前进程中的 Hook 开启状态，首次从已有 handler 恢复；开启后配置缺失会触发自愈。`isVerified` 保存最近一次校验的明确结论，`isOperable` 为两者的合取

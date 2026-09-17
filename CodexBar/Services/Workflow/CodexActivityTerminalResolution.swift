@@ -1,7 +1,62 @@
 import Combine
 import Foundation
+import os
 
 extension CodexActivityMonitor {
+    /// Interrupt 只结束匹配的 turn, 不清空同 session 的新任务
+    func interruptTask(from event: WorkflowHookEvent, source: CodexActivityEventSource) {
+        let eventKey = CodexActivityTaskKey(event: event)
+        if recentEndedDate(for: eventKey) != nil {
+            discardStaleTerminalTask(for: eventKey)
+            return
+        }
+
+        let match = matchingTerminalTask(for: event, allowsAnonymousFallback: event.sessionId == nil)
+        let key: CodexActivityTaskKey
+        let task: CodexActivityTask?
+        switch match {
+        case let .active(matchedKey):
+            key = matchedKey
+            task = tasks[key]
+        case let .pending(matchedKey):
+            key = matchedKey
+            task = pendingTerminalTasks[key]?.task
+        case .ambiguous:
+            AppLog.activity.error("任务中断未关联: reason=ambiguousInterrupt")
+            return
+        case .none:
+            key = eventKey
+            task = nil
+        }
+        guard task.map({ event.timestamp >= $0.lastMainHookEventAt }) ?? true else {
+            return
+        }
+        if recentEndedDate(for: key) != nil {
+            discardStaleTerminalTask(for: key)
+            return
+        }
+
+        tasks.removeValue(forKey: key)
+        pendingTerminalTasks.removeValue(forKey: key)
+        clearActivityProtection(for: key, taskID: task?.displayID, reason: .terminal)
+        storeTermination(
+            for: key,
+            projectName: event.projectDisplayName ?? task?.projectName,
+            modelName: event.modelName ?? task?.modelName,
+            effort: event.effort ?? task?.effort,
+            terminatedAt: event.timestamp,
+            duration: task?.preciseDuration(until: event.timestamp)
+        )
+        recordEndedTask(key, at: event.timestamp)
+        if let resolved = task?.resolvedTurnKey {
+            recordEndedTask(resolved, at: event.timestamp)
+        }
+        recordEndedTask(eventKey, at: event.timestamp)
+        if source == .live {
+            AppLog.activity.notice("任务已终止: source=interruptHook")
+        }
+    }
+
     // MARK: - 终态判定与记录
 
     /// PermissionRequest 表示进入审批流程; 只有 rollout 明确把审批路由给 user 时才是 UI 等待
@@ -9,29 +64,19 @@ extension CodexActivityMonitor {
         for task: inout CodexActivityTask,
         into transitions: inout [CodexActivityTransition]
     ) -> Bool {
-        guard let requestedAt = task.pendingApprovalRequestedAt,
-              let approvalReviewer = task.approvalReviewer else {
-            return false
-        }
-
-        switch approvalReviewer {
-        case .user:
-            let wasWaiting = task.state == .waitingApproval
-            task.confirmPendingApproval()
-            if !wasWaiting,
-               !task.key.isAnonymous,
-               let sessionTransitionNotBefore,
-               requestedAt >= sessionTransitionNotBefore {
-                transitions.append(.waitingApproval(task.snapshot))
-            }
-        case .autoReview, .guardianSubagent:
-            task.pendingApprovalRequestedAt = nil
+        let wasWaiting = task.state == .waitingApproval
+        guard task.resolvePendingApprovals() else { return false }
+        if !wasWaiting, task.state == .waitingApproval, canPublishActivityTransitions,
+           !task.key.isAnonymous, let sessionTransitionNotBefore,
+           task.stateChangedAt >= sessionTransitionNotBefore,
+           Date().timeIntervalSince(task.stateChangedAt) <= 10 {
+            transitions.append(.waitingApproval(task.snapshot))
         }
         return true
     }
 
     /// rollout 终态归类的唯一入口; 活动任务和等待终态确认任务只有 abort 兜底时间不同
-    /// 终止记录只供任务中心展示, 不发布 transition, 也不产生绿色状态或通知
+    /// 终止记录供任务中心和流光展示, 不发布通知 transition
     func resolveTerminal(
         _ terminal: CodexSessionTaskTerminalState,
         task: CodexActivityTask,
@@ -44,11 +89,17 @@ extension CodexActivityMonitor {
             taskID: task.displayID,
             reason: .terminal
         )
+        guard recentEndedDate(for: key) == nil else {
+            return
+        }
         switch terminal {
         case let .aborted(reportedAt):
             let terminatedAt = max(reportedAt ?? abortFallback, task.lastActivityAt)
             storeTermination(task, at: terminatedAt, includesDuration: reportedAt != nil)
-            recordTerminatedTask(key, at: terminatedAt)
+            recordEndedTask(key, at: terminatedAt)
+            if let resolved = task.resolvedTurnKey {
+                recordEndedTask(resolved, at: terminatedAt)
+            }
         case let .completed(completedAt, duration):
             let completion = storeResolvedCompletion(
                 task,
@@ -56,7 +107,8 @@ extension CodexActivityMonitor {
                 completedAt: completedAt,
                 reportedDuration: duration
             )
-            if !completion.isAnonymous,
+            if canPublishActivityTransitions, !completion.isAnonymous,
+               Date().timeIntervalSince(completion.completedAt) <= 10,
                let sessionTransitionNotBefore,
                completion.completedAt >= sessionTransitionNotBefore {
                 transitions.append(.completed(completion))
@@ -91,48 +143,30 @@ extension CodexActivityMonitor {
         return didChange
     }
 
-    func storeResolvedCompletion(
+    private func storeResolvedCompletion(
         _ task: CodexActivityTask,
         key: CodexActivityTaskKey,
         completedAt: Date,
-        reportedDuration: TimeInterval?,
-        projectName: String? = nil,
-        modelName: String? = nil,
-        effort: String? = nil
+        reportedDuration: TimeInterval?
     ) -> CodexActivityCompletion {
         // rollout 时间戳是整秒, 避免因为同一秒内的 Hook 毫秒时间戳而把完成时间记在最后活动之前
         let recordedCompletedAt = max(completedAt, task.lastActivityAt)
-        let completion = storeCompletion(
-            for: key,
-            projectName: projectName ?? task.projectName,
-            modelName: modelName ?? task.modelName,
-            effort: effort ?? task.effort,
-            completedAt: recordedCompletedAt,
-            duration: reportedDuration ?? task.preciseDuration(until: recordedCompletedAt)
-        )
-        recordCompletedTask(key, at: recordedCompletedAt)
-        return completion
-    }
-
-    func storeCompletion(
-        for key: CodexActivityTaskKey,
-        projectName: String?,
-        modelName: String?,
-        effort: String?,
-        completedAt: Date,
-        duration: TimeInterval?
-    ) -> CodexActivityCompletion {
         let completion = CodexActivityCompletion(
             id: UUID(),
             isAnonymous: key.isAnonymous,
-            projectName: projectName,
-            modelName: modelName,
-            effort: effort,
-            completedAt: completedAt,
-            duration: duration
+            projectName: task.projectName,
+            modelName: task.modelName,
+            effort: task.effort,
+            completedAt: recordedCompletedAt,
+            duration: reportedDuration ?? task.preciseDuration(until: recordedCompletedAt)
         )
         completions.append(completion)
         terminalTaskKeyByID[completion.id] = key
+        recordTerminalPresentationEvent(.completed(completion))
+        recordEndedTask(key, at: recordedCompletedAt)
+        if let resolved = task.resolvedTurnKey {
+            recordEndedTask(resolved, at: recordedCompletedAt)
+        }
         return completion
     }
 
@@ -141,58 +175,79 @@ extension CodexActivityMonitor {
         at terminatedAt: Date,
         includesDuration: Bool
     ) {
-        let termination = CodexActivityTermination(
-            id: UUID(),
-            isAnonymous: task.key.isAnonymous,
+        storeTermination(
+            for: task.key,
             projectName: task.projectName,
             modelName: task.modelName,
             effort: task.effort,
             terminatedAt: terminatedAt,
             duration: includesDuration ? task.preciseDuration(until: terminatedAt) : nil
         )
+    }
+
+    private func storeTermination(
+        for key: CodexActivityTaskKey,
+        projectName: String?,
+        modelName: String?,
+        effort: String?,
+        terminatedAt: Date,
+        duration: TimeInterval?
+    ) {
+        let termination = CodexActivityTermination(
+            id: UUID(),
+            isAnonymous: key.isAnonymous,
+            projectName: projectName,
+            modelName: modelName,
+            effort: effort,
+            terminatedAt: terminatedAt,
+            duration: duration
+        )
         terminations.append(termination)
-        terminalTaskKeyByID[termination.id] = task.key
+        terminalTaskKeyByID[termination.id] = key
+        recordTerminalPresentationEvent(.terminated(termination))
     }
 
-    func recentCompletionDate(
+    func recordTerminalPresentationEvent(_ event: CodexActivityTerminalEvent) {
+        guard canPublishActivityTransitions, Date().timeIntervalSince(event.endedAt) <= 10,
+              event.endedAt >= terminalPresentationNotBefore else {
+            return
+        }
+        pendingTerminalPresentationEvents.append(event)
+    }
+
+    func resetTerminalPresentationEvents() {
+        pendingTerminalPresentationEvents.removeAll()
+        // 延迟确认仍使用原始结束时间, 恢复前的旧终态不能在恢复后补播
+        terminalPresentationNotBefore = Date()
+    }
+
+    func recentEndedDate(
         for key: CodexActivityTaskKey,
         now: Date = Date()
     ) -> Date? {
-        Self.recentTerminalDate(
-            for: key,
-            storedIn: &recentlyCompletedTaskAt,
-            now: now
-        )
+        guard let date = recentlyEndedTaskAt[key] else {
+            return nil
+        }
+        if key.isSessionOnly, let startedAt = tasks[key]?.startedAt, startedAt > date {
+            return nil
+        }
+        guard date > now.addingTimeInterval(-Self.endedTaskRetention) else {
+            recentlyEndedTaskAt.removeValue(forKey: key)
+            return nil
+        }
+        return date
     }
 
-    func recentTerminationDate(
-        for key: CodexActivityTaskKey,
-        now: Date = Date()
-    ) -> Date? {
-        Self.recentTerminalDate(
-            for: key,
-            storedIn: &recentlyTerminatedTaskAt,
-            now: now
-        )
-    }
-
-    func recordCompletedTask(_ key: CodexActivityTaskKey, at completedAt: Date) {
-        Self.recordTerminalTask(
-            key,
-            at: completedAt,
-            storedIn: &recentlyCompletedTaskAt
-        )
-    }
-
-    func recordTerminatedTask(_ key: CodexActivityTaskKey, at terminatedAt: Date) {
-        Self.recordTerminalTask(
-            key,
-            at: terminatedAt,
-            storedIn: &recentlyTerminatedTaskAt
-        )
+    func recordEndedTask(_ key: CodexActivityTaskKey, at date: Date) {
+        recentlyEndedTaskAt[key] = max(recentlyEndedTaskAt[key] ?? .distantPast, date)
+        if let sessionId = key.sessionId {
+            let sessionKey = CodexActivityTaskKey.session(sessionId)
+            recentlyEndedTaskAt[sessionKey] = max(recentlyEndedTaskAt[sessionKey] ?? .distantPast, date)
+        }
     }
 
     func clearCollectedActivityState() {
+        resetTerminalPresentationEvents()
         cancelAllActivityProtectionAttempts()
         let taskIDs = Set(tasks.values.map(\.displayID))
             .union(pendingTerminalTasks.values.map(\.task.displayID))
@@ -203,52 +258,21 @@ extension CodexActivityMonitor {
         pendingTerminalTasks.removeAll()
         completions.removeAll()
         terminations.removeAll()
-        recentlyCompletedTaskAt.removeAll()
-        recentlyTerminatedTaskAt.removeAll()
+        recentlyEndedTaskAt.removeAll()
         terminalTaskKeyByID.removeAll()
-        ignoredAutoReviewTaskAt.removeAll()
-    }
-
-    static func recentTerminalDate(
-        for key: CodexActivityTaskKey,
-        storedIn dates: inout [CodexActivityTaskKey: Date],
-        now: Date
-    ) -> Date? {
-        guard let date = dates[key] else {
-            return nil
-        }
-        guard date > now.addingTimeInterval(-completedTaskRetention) else {
-            dates.removeValue(forKey: key)
-            return nil
-        }
-        return date
-    }
-
-    static func recordTerminalTask(
-        _ key: CodexActivityTaskKey,
-        at date: Date,
-        storedIn dates: inout [CodexActivityTaskKey: Date]
-    ) {
-        dates[key] = max(dates[key] ?? .distantPast, date)
-        if let sessionId = key.sessionId {
-            let sessionKey = CodexActivityTaskKey.session(sessionId)
-            dates[sessionKey] = max(dates[sessionKey] ?? .distantPast, date)
-        }
+        activityTaskOrigins.removeAll()
+        pendingSubagentEvents.removeAll()
+        subagentTurnLinks.removeAll()
     }
 
     func finalizeExpiredPendingTerminalTasks(now: Date) {
         let expiredKeys = pendingTerminalTasks.compactMap { key, pending in
-            pending.deadline <= now ? key : nil
+            pending.expiresAt <= now ? key : nil
         }
         for key in expiredKeys {
             guard let pending = pendingTerminalTasks.removeValue(forKey: key) else {
                 continue
             }
-            let terminatedAt = max(pending.supersededAt, pending.task.lastActivityAt)
-            if pending.task.state != .suppressed {
-                storeTermination(pending.task, at: terminatedAt, includesDuration: true)
-            }
-            recordTerminatedTask(key, at: terminatedAt)
             clearActivityProtection(
                 for: key,
                 taskID: pending.task.displayID,
@@ -257,33 +281,32 @@ extension CodexActivityMonitor {
         }
     }
 
-    func publishLiveTransitions(_ transitions: [CodexActivityLiveTransition]) {
+    func publishWaitingApprovalTransitions(_ taskKeys: [CodexActivityTaskKey]) {
+        for transition in waitingApprovalTransitions(taskKeys) {
+            transitionSubject.send(transition)
+        }
+    }
+
+    func waitingApprovalTransitions(_ taskKeys: [CodexActivityTaskKey]) -> [CodexActivityTransition] {
+        guard canPublishActivityTransitions else { return [] }
+        var transitions: [CodexActivityTransition] = []
         var lastWaitingIndexByKey: [CodexActivityTaskKey: Int] = [:]
-        for (index, transition) in transitions.enumerated() {
-            if case let .waitingApproval(key) = transition {
-                lastWaitingIndexByKey[key] = index
-            }
+        for (index, key) in taskKeys.enumerated() {
+            lastWaitingIndexByKey[key] = index
         }
 
-        var publishedCompletionIDs = Set<UUID>()
-        for (index, transition) in transitions.enumerated() {
-            switch transition {
-            case let .waitingApproval(key):
-                guard !key.isAnonymous,
-                      lastWaitingIndexByKey[key] == index,
-                      let task = tasks[key],
-                      task.state == .waitingApproval else {
-                    continue
-                }
-                transitionSubject.send(.waitingApproval(task.snapshot))
-            case let .completed(completion):
-                guard !completion.isAnonymous,
-                      terminalTaskKeyByID[completion.id] != nil,
-                      publishedCompletionIDs.insert(completion.id).inserted else {
-                    continue
-                }
-                transitionSubject.send(.completed(completion))
+        for (index, key) in taskKeys.enumerated() {
+            guard !key.isAnonymous,
+                  lastWaitingIndexByKey[key] == index,
+                  let task = tasks[key],
+                  task.state == .waitingApproval,
+                  let sessionTransitionNotBefore,
+                  task.stateChangedAt >= sessionTransitionNotBefore,
+                  Date().timeIntervalSince(task.stateChangedAt) <= 10 else {
+                continue
             }
+            transitions.append(.waitingApproval(task.snapshot))
         }
+        return transitions
     }
 }

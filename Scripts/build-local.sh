@@ -17,6 +17,7 @@ if configuration not in ("Debug", "Release"):
     raise SystemExit("CODEXBAR_BUILD_CONFIGURATION 必须为 Debug 或 Release")
 app_name = "CodexBar Debug.app" if configuration == "Debug" else "CodexBar.app"
 output.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("LLVM_PROFILE_FILE", str(output / "coverage-%p.profraw"))
 with tempfile.TemporaryDirectory(prefix="codexbar-local-build.", dir="/tmp") as directory:
     stage = Path(directory)
     for item in root.iterdir():
@@ -49,6 +50,10 @@ with tempfile.TemporaryDirectory(prefix="codexbar-local-build.", dir="/tmp") as 
     # 默认临时签名, 已配置开发证书时可显式使用同一身份签署 App 与电源组件
     app = stage / app_name
     subprocess.run(["ditto", "--noextattr", str(output / "DerivedData/Build/Products" / configuration / app.name), str(app)], check=True)
+    for cache in app.rglob("__pycache__"):
+        shutil.rmtree(cache)
+    for bytecode in app.rglob("*.pyc"):
+        bytecode.unlink()
     subprocess.run(["xattr", "-cr", str(app)], check=True)
     identity = os.environ.get("CODEXBAR_SIGNING_IDENTITY")
     if identity is None and not os.environ.get("CI"):

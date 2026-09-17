@@ -9,6 +9,8 @@ nonisolated struct RemoteActivityTask: Decodable, Identifiable, Equatable, Senda
     let updatedAt: TimeInterval
     let startedAt: TimeInterval
     let modelName: String?
+    var stateChangedAt: TimeInterval?
+    var effort: String?
     var eventName: String?
     var toolName: String?
     var activeSubagentCount: Int?
@@ -43,8 +45,9 @@ nonisolated struct RemoteActivityFrame: Decodable, Sendable {
                     && ["running", "waiting", "completed", "ended", "unknown"].contains($0.state)
                     && $0.project.count <= 100 && $0.startedAt.isFinite && $0.updatedAt.isFinite
                     && ($0.modelName?.count ?? 0) <= 100 && ($0.eventName?.count ?? 0) <= 50
-                    && ($0.toolName?.count ?? 0) <= 120 && (0 ... 1000).contains($0.activeSubagentCount ?? 0)
+                    && ($0.effort?.count ?? 0) <= 40 && ($0.toolName?.count ?? 0) <= 120 && (0 ... 1000).contains($0.activeSubagentCount ?? 0)
                     && $0.startedAt > 0 && $0.updatedAt >= $0.startedAt
+                    && ($0.stateChangedAt.map(\.isFinite) ?? true)
             }
     }
 }
@@ -221,6 +224,11 @@ nonisolated enum ActivityStreamClient {
 @MainActor
 final class RemoteActivityController: ObservableObject {
     var onTransition: ((String, RemoteActivityTask) -> Void)?
+    private let terminalSubject = PassthroughSubject<(String, RemoteActivityTask), Never>()
+    var terminalPublisher: AnyPublisher<(String, RemoteActivityTask), Never> {
+        terminalSubject.eraseToAnyPublisher()
+    }
+
     @Published private(set) var tasks: [String: [RemoteActivityTask]] = [:]
     @Published private(set) var states: [String: String] = [:]
     @Published private(set) var enabledSourceIDs: Set<String>
@@ -306,9 +314,20 @@ final class RemoteActivityController: ObservableObject {
         }
     }
 
+    static func liveTerminals(previous: [RemoteActivityTask], frame: RemoteActivityFrame, wasConnected: Bool) -> [RemoteActivityTask] {
+        guard wasConnected else { return [] }
+        let oldByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        return frame.tasks.filter { task in
+            guard let old = oldByID[task.id], old.isActive, old.startedAt == task.startedAt,
+                  task.state == "completed" || task.state == "ended" else { return false }
+            return (0 ... 10).contains(frame.sentAt - task.updatedAt)
+        }
+    }
+
     private func receive(_ frame: RemoteActivityFrame, sourceID: String, generation: UUID) {
         guard generations[sourceID] == generation else { return }
         let previous = Dictionary(uniqueKeysWithValues: (tasks[sourceID] ?? []).map { ($0.id, $0) })
+        let liveTerminals = Self.liveTerminals(previous: Array(previous.values), frame: frame, wasConnected: states[sourceID] == "实时连接")
         // 首次和重连只恢复基线, 不把离线期间的旧变化当成新通知
         if states[sourceID] == "实时连接" {
             for task in frame.tasks {
@@ -323,6 +342,9 @@ final class RemoteActivityController: ObservableObject {
         }
         if states[sourceID] != "实时连接" {
             states[sourceID] = "实时连接"
+        }
+        for task in liveTerminals {
+            terminalSubject.send((sourceID, task))
         }
     }
 }

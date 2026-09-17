@@ -5,6 +5,7 @@ usage_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$usage_root"
 usage_tmp="$(mktemp -d /tmp/codexbar-usage-check.XXXXXXXX)"
 trap 'rm -rf "$usage_tmp"' EXIT
+export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE:-$usage_tmp/coverage-%p.profraw}"
 
 python3 -B -m unittest discover -s Tests -p 'test_usage_*.py' -v
 usage_compiler="${CODEXBAR_SWIFTC:-swiftc}"

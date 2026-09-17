@@ -137,6 +137,7 @@ struct UsageSummaryView: View {
         metric(label: label) {
             if let value {
                 TokenCountText(tokens: value)
+                    .minimumScaleFactor(0.8)
             } else {
                 Text(verbatim: "--")
                     .font(.caption.monospacedDigit().weight(.semibold))
@@ -671,7 +672,7 @@ struct UsageHeatmapDayDetailView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: Metrics.headerSpacing) {
+        HStack(alignment: .center, spacing: 0) {
             dateText
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
@@ -684,7 +685,6 @@ struct UsageHeatmapDayDetailView: View {
             }
 
             tokenText
-                .frame(minWidth: Metrics.tokenMinimumWidth, alignment: .trailing)
         }
     }
 
@@ -887,7 +887,7 @@ struct UsageHeatmapDayDetailView: View {
 
     private func fittingMetricValue(_ value: String, comparison: Double) -> some View {
         fittingValueContent(value)
-            .numericRollTransition(value: comparison)
+            .contentTransition(.numericText(value: comparison))
             .layoutPriority(1)
             .frame(maxWidth: .infinity, alignment: .trailing)
     }
@@ -932,7 +932,6 @@ struct UsageHeatmapDayDetailView: View {
         static let workflowPanelHeight: CGFloat = 208
         static let tokenPanelHeight: CGFloat = 84
         static let sectionSpacing: CGFloat = 8
-        static let headerSpacing: CGFloat = 10
         static let horizontalPadding: CGFloat = 12
         static let verticalPadding: CGFloat = 10
         static let cornerRadius: CGFloat = 12
@@ -962,7 +961,6 @@ private struct HeatmapTokenText: View {
 
     @State private var displayedTokenState: UsageHeatmapTokenState
     @State private var isVisible = true
-    @State private var fadeTask: Task<Void, Never>?
 
     init(
         tokenState: UsageHeatmapTokenState,
@@ -980,12 +978,9 @@ private struct HeatmapTokenText: View {
     var body: some View {
         content
             .opacity(isVisible ? 1 : 0)
-            .frame(width: width, alignment: .trailing)
-            .onChange(of: tokenState) { _, newTokenState in
-                updateDisplayedTokenState(newTokenState)
-            }
-            .onDisappear {
-                fadeTask?.cancel()
+            .frame(minWidth: width, alignment: .trailing)
+            .task(id: tokenState) {
+                await updateDisplayedTokenState(tokenState)
             }
     }
 
@@ -1013,9 +1008,7 @@ private struct HeatmapTokenText: View {
         }
     }
 
-    private func updateDisplayedTokenState(_ newTokenState: UsageHeatmapTokenState) {
-        fadeTask?.cancel()
-
+    private func updateDisplayedTokenState(_ newTokenState: UsageHeatmapTokenState) async {
         guard displayedTokenState != newTokenState || !isVisible else {
             return
         }
@@ -1027,7 +1020,7 @@ private struct HeatmapTokenText: View {
                 isVisible = true
             }
         } else {
-            fadeToTokenState(newTokenState)
+            await fadeToTokenState(newTokenState)
         }
     }
 
@@ -1038,23 +1031,19 @@ private struct HeatmapTokenText: View {
         }
     }
 
-    private func fadeToTokenState(_ newTokenState: UsageHeatmapTokenState) {
-        fadeTask = Task { @MainActor in
-            withAnimation(Metrics.fadeAnimation) {
-                isVisible = false
-            }
+    private func fadeToTokenState(_ newTokenState: UsageHeatmapTokenState) async {
+        withAnimation(Metrics.fadeAnimation) {
+            isVisible = false
+        }
 
-            try? await Task.sleep(for: .milliseconds(Metrics.fadeDelayMilliseconds))
-            guard !Task.isCancelled else {
-                return
-            }
+        try? await Task.sleep(for: .milliseconds(Metrics.fadeDelayMilliseconds))
+        guard !Task.isCancelled else {
+            return
+        }
 
-            displayedTokenState = newTokenState
-            withAnimation(Metrics.fadeAnimation) {
-                isVisible = true
-            }
-
-            fadeTask = nil
+        displayedTokenState = newTokenState
+        withAnimation(Metrics.fadeAnimation) {
+            isVisible = true
         }
     }
 
@@ -1084,7 +1073,7 @@ private struct AnimatedDateText: View {
                 Text(verbatim: components.day)
             }
             .font(font)
-            .numericRollTransition(value: dateValue(components))
+            .contentTransition(.numericText(value: dateValue(components)))
         } else {
             Text(verbatim: startDate)
                 .font(font)

@@ -10,7 +10,7 @@ CodexBar Hook provides live task status, task notifications, haptics, task-based
 2. Enable `CodexBar Hook` and wait for validation
 3. Start a Codex task and check its status in the main panel
 
-Hook requires the Codex currently in use to be `0.145.0` or later. If the version warning remains after upgrading, click `Reconnect` in `Settings > About`. For other errors, see [Troubleshooting](troubleshooting.md#codexbar-hook-cannot-be-enabled-or-validated).
+Hook requires the Codex currently in use to be `0.150.0` or later. If the version warning remains after upgrading, click `Reconnect` in `Settings > About`. For other errors, see [Troubleshooting](troubleshooting.md#codexbar-hook-cannot-be-enabled-or-validated).
 
 CodexBar automatically checks and repairs enabled Hook configuration. Enabling or disabling it preserves Hooks belonging to you and other apps.
 

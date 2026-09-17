@@ -4,7 +4,7 @@
 
 ## Environment and Build
 
-Requires macOS 15+, Xcode, Swift 6, `swiftformat`, and `swiftlint`. The only scheme is `CodexBar`, containing the app and `CodexBarHelper` targets. There is no XCTest target.
+Requires macOS 15+, Xcode, Swift 6, `swiftformat`, and `swiftlint`. The only scheme is `CodexBar`, containing the app, `CodexBarHelper`, and the hostless Swift Testing target `CodexBarTests`. Run `bash Scripts/test-local.sh` for the isolated unit tests.
 
 ```bash
 xcodebuild -project CodexBar.xcodeproj -scheme CodexBar -destination 'generic/platform=macOS' build
@@ -124,3 +124,7 @@ Helper cleanup cancels and verifies an empty system wake schedule before unregis
 ## Fork integration
 
 Use bash Scripts/build-local.sh for the independent Debug build and bash Scripts/verify-usage-center.sh for regression checks. Release workflow configuration and migration instructions are in the [fork release guide](../../DeveloperGuide/releasing.md). Manually verify all provider transitions, close/reopen, expansion, and side-panel cleanup. Ad-hoc builds cannot validate signed Helper operation.
+
+## Issue notifications
+
+The Issue notification workflow sends new issues and comments from other users to Bark, excluding pull requests and events from the configured owner. Set the `BARK_TOKEN` repository secret to the device key. Optional secrets are `BARK_SERVER_URL` (defaults to `https://api.day.app`) and `BARK_ICON_URL`. `SELF_LOGIN` is an optional repository variable for the ignored account. Missing credentials skip delivery. The title and issue link are sent over HTTPS POST; device keys are not printed or placed in URLs. No Mac background service is involved.

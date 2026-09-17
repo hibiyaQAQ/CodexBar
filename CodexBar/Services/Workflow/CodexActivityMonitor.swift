@@ -12,6 +12,10 @@ final class CodexActivityMonitor: ObservableObject {
         transitionSubject.eraseToAnyPublisher()
     }
 
+    var presentationPublisher: AnyPublisher<CodexActivityPresentationUpdate, Never> {
+        presentationSubject.eraseToAnyPublisher()
+    }
+
     var onInactivityProtectionTriggered: ((CodexActivityProtectionNotice) async -> Bool)?
     var onInactivityProtectionInvalidated: ((UUID, UUID) -> Void)?
 
@@ -20,17 +24,25 @@ final class CodexActivityMonitor: ObservableObject {
     let activityProtectionStateStore: ActivityProtectionStateStore
     private let sessionLifecycleReader = CodexSessionLifecycleReader()
     let transitionSubject = PassthroughSubject<CodexActivityTransition, Never>()
+    private let presentationSubject = PassthroughSubject<CodexActivityPresentationUpdate, Never>()
+    var pendingTerminalPresentationEvents: [CodexActivityTerminalEvent] = []
+    var terminalPresentationNotBefore = Date()
     var tasks: [CodexActivityTaskKey: CodexActivityTask] = [:]
+    var subagentTurnLinks: [CodexActivityTurnReference: CodexActivityTaskKey] = [:]
+    var pendingSubagentEvents: [CodexPendingSubagentEvent] = []
     var pendingTerminalTasks: [CodexActivityTaskKey: PendingTerminalTask] = [:]
     var completions: [CodexActivityCompletion] = []
     var terminations: [CodexActivityTermination] = []
-    var recentlyCompletedTaskAt: [CodexActivityTaskKey: Date] = [:]
-    var recentlyTerminatedTaskAt: [CodexActivityTaskKey: Date] = [:]
+    var recentlyEndedTaskAt: [CodexActivityTaskKey: Date] = [:]
     var terminalTaskKeyByID: [UUID: CodexActivityTaskKey] = [:]
-    var ignoredAutoReviewTaskAt: [CodexActivityTaskKey: Date] = [:]
+    var activityTaskOrigins: [CodexActivityTaskKey: (origin: WorkflowEventOrigin, observedAt: Date)] = [:]
     var tailReader: HookEventTailReader?
     private var tailReaderControlTask: Task<Void, Never>?
     private var tailReaderGeneration: UInt64 = 0
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryTaskID: UUID?
+    private var isSystemSleeping = false
+    private var isReconcilingLifecycles = false
     private var sessionLifecyclePollTask: Task<Void, Never>?
     private var cleanupTask: Task<Void, Never>?
     private var cleanupDeadline: Date?
@@ -99,6 +111,8 @@ final class CodexActivityMonitor: ObservableObject {
                 guard let self else {
                     return
                 }
+                isSystemSleeping = true
+                recoveryTask?.cancel()
                 beginActivityProtectionRecovery()
                 AppLog.activity.notice("异常任务判定已暂停: reason=systemSleep")
             }
@@ -114,29 +128,8 @@ final class CodexActivityMonitor: ObservableObject {
                 AppLog.activity.notice(
                     "事件重读已触发: trigger=\(LogTrigger.wake.rawValue, privacy: .public)"
                 )
-                let recoveryGeneration = beginActivityProtectionRecovery()
-                guard let reader = tailReader else {
-                    finishActivityProtectionRecovery(generation: recoveryGeneration)
-                    return
-                }
-                let readerGeneration = tailReaderGeneration
-                Task { @MainActor [weak self] in
-                    let drainResult = await reader.drainNow()
-                    guard let self,
-                          readerGeneration == tailReaderGeneration else {
-                        return
-                    }
-                    guard case .completed = drainResult else {
-                        finishActivityProtectionRecovery(generation: recoveryGeneration)
-                        return
-                    }
-                    await sessionLifecycleReader.resetResolutionFallbacks()
-                    await reconcileSessionLifecycles(generation: readerGeneration)
-                    guard readerGeneration == tailReaderGeneration else {
-                        return
-                    }
-                    finishActivityProtectionRecovery(generation: recoveryGeneration)
-                }
+                isSystemSleeping = false
+                requestActivityRecovery()
             }
             .store(in: &cancellables)
 
@@ -226,6 +219,8 @@ final class CodexActivityMonitor: ObservableObject {
 
     private func stopReaderAndClearState() {
         tailReaderGeneration &+= 1
+        recoveryTask?.cancel()
+        recoveryTask = nil
         resetActivityProtectionRecovery()
         tailReaderControlTask?.cancel()
         tailReaderControlTask = nil
@@ -261,7 +256,13 @@ final class CodexActivityMonitor: ObservableObject {
                 guard let self else {
                     return
                 }
-                await reconcileSessionLifecycles(generation: generation)
+                if isActivityProtectionRecoveryInProgress {
+                    if !isSystemSleeping, recoveryTask == nil {
+                        requestActivityRecovery()
+                    }
+                } else {
+                    _ = await reconcileSessionLifecycles(generation: generation, terminalOnly: !isActivitySourceHealthy)
+                }
                 try? await Task.sleep(for: .seconds(Self.sessionLifecyclePollInterval))
             }
         }
@@ -293,16 +294,20 @@ final class CodexActivityMonitor: ObservableObject {
     /// 待确认终态的任务与在跑的任务走两条分支, 前者已经从 tasks 里挪走
     private func applyLifecycleState(
         _ state: CodexSessionTaskLifecycleState,
+        terminalOnly: Bool = false,
         into transitions: inout [CodexActivityTransition]
     ) -> Bool {
-        let key = CodexActivityTaskKey.turn(session: state.sessionId, turn: state.turnId)
+        guard !terminalOnly || (state.readStatus == .complete && state.terminal != nil) else { return false }
+        let exact = CodexActivityTaskKey.turn(session: state.sessionId, turn: state.turnId)
+        let key = tasks.first(where: { $0.value.resolvedTurnKey == exact })?.key
+            ?? pendingTerminalTasks.first(where: { $0.value.task.resolvedTurnKey == exact })?.key ?? exact
         if var pending = pendingTerminalTasks[key] {
             let pendingDidChange = Self.mergeLifecycleBackfill(
                 from: state,
                 into: &pending.task
             )
 
-            guard let terminal = state.terminal else {
+            guard state.readStatus == .complete, let terminal = state.terminal else {
                 guard pendingDidChange else {
                     return false
                 }
@@ -324,25 +329,24 @@ final class CodexActivityMonitor: ObservableObject {
             return false
         }
 
-        var taskDidChange = Self.mergeLifecycleBackfill(from: state, into: &task)
-        let progressDidChange = mergeLifecycleProgress(
+        let hadLifecycleCoverage = task.lifecycleCoverageCheckedAt != nil
+        if !terminalOnly {
+            let now = Date()
+            task.recordLifecycleRead(state, at: now)
+            if task.activityProtectionDeadline(at: now, inactivityDuration: activityProtectionSettings.inactivityDuration.timeInterval)
+                .map({ $0 <= now }) != true {
+                cancelActivityProtectionAttempt(for: key)
+            }
+        }
+        _ = Self.mergeLifecycleBackfill(from: state, into: &task)
+        let progressDidChange = !terminalOnly && mergeLifecycleProgress(
             from: state,
             key: key,
             into: &task
         )
-        taskDidChange = progressDidChange || taskDidChange
 
-        if let terminal = state.terminal {
+        if state.readStatus == .complete, let terminal = state.terminal {
             tasks.removeValue(forKey: key)
-            if case .completed = terminal, recentCompletionDate(for: key) != nil {
-                // 迟到事件恢复出的任务不能被 rollout 再次完成
-                clearActivityProtection(
-                    for: key,
-                    taskID: task.displayID,
-                    reason: .terminal
-                )
-                return true
-            }
             resolveTerminal(
                 terminal,
                 task: task,
@@ -353,11 +357,7 @@ final class CodexActivityMonitor: ObservableObject {
             return true
         }
 
-        if let approvalReviewer = state.approvalReviewer,
-           task.approvalReviewer != approvalReviewer {
-            task.approvalReviewer = approvalReviewer
-            taskDidChange = true
-        }
+        task.mergeExecutionLifecycle(state, owner: CodexActivityExecutionKey(agentId: nil, turnId: state.turnId))
 
         let wasSuppressedBeforeApproval = task.state == .suppressed
         if resolvePendingApprovalIfPossible(
@@ -371,25 +371,22 @@ final class CodexActivityMonitor: ObservableObject {
                     reason: .progress
                 )
             }
-            taskDidChange = true
         }
 
-        guard taskDidChange else {
-            return false
-        }
         tasks[key] = task
-        if progressDidChange {
+        if progressDidChange || (!hadLifecycleCoverage && task.lifecycleCoverageCheckedAt != nil) {
             suppressBackfilledActivityTaskIfOverdue(key, now: Date())
         }
         return true
     }
 
-    private func mergeLifecycleProgress(
+    func mergeLifecycleProgress(
         from state: CodexSessionTaskLifecycleState,
         key: CodexActivityTaskKey,
         into task: inout CodexActivityTask
     ) -> Bool {
-        guard let lastProgressAt = state.lastProgressAt,
+        guard state.readStatus == .complete,
+              let lastProgressAt = state.lastProgressAt,
               lastProgressAt > task.lastProgressAt else {
             return false
         }
@@ -410,38 +407,103 @@ final class CodexActivityMonitor: ObservableObject {
         return true
     }
 
-    private func reconcileSessionLifecycles(generation: UInt64) async {
-        guard generation == tailReaderGeneration,
-              tailReader != nil,
-              !isBootstrapping else {
-            return
+    /// 恢复只由读取屏障后的调用推进, 普通 poll 不能绕过恢复代次
+    private func requestActivityRecovery() {
+        guard !isSystemSleeping, let reader = tailReader, !isBootstrapping else { return }
+        recoveryTask?.cancel()
+        let recoveryGeneration = beginActivityProtectionRecovery()
+        let generation = tailReaderGeneration
+        let taskID = UUID()
+        recoveryTaskID = taskID
+        recoveryTask = Task { @MainActor [weak self] in
+            let result = await reader.drainNow()
+            guard let self else { return }
+            defer {
+                if recoveryTaskID == taskID {
+                    recoveryTask = nil
+                    recoveryTaskID = nil
+                }
+            }
+            guard !Task.isCancelled, generation == tailReaderGeneration,
+                  recoveryGeneration == activityProtectionRecoveryGeneration else { return }
+            if case .sourceUnavailable = result {
+                // Hook 缺口只阻止完整恢复, 独立读取成功的明确终态仍可静默收敛
+                _ = await reconcileSessionLifecycles(generation: generation, terminalOnly: true)
+                return
+            }
+            guard case .completed = result, isActivitySourceHealthy, !isBootstrapping else { return }
+            await sessionLifecycleReader.resetResolutionFallbacks()
+            guard !Task.isCancelled, !isSystemSleeping,
+                  recoveryGeneration == activityProtectionRecoveryGeneration else { return }
+            let didReconcile = await reconcileSessionLifecycles(generation: generation, recovering: true)
+            guard didReconcile, !Task.isCancelled, generation == tailReaderGeneration,
+                  recoveryGeneration == activityProtectionRecoveryGeneration else { return }
+            finishActivityProtectionRecovery(generation: recoveryGeneration)
         }
-        let references = tasks.values.compactMap(\.turnReference)
-            + pendingTerminalTasks.values.compactMap(\.task.turnReference)
-        guard !references.isEmpty else {
-            return
-        }
-        let states = await sessionLifecycleReader.lifecycleStates(for: references)
-        guard !Task.isCancelled,
-              generation == tailReaderGeneration,
-              tailReader != nil,
-              !isBootstrapping,
-              !states.isEmpty else {
-            return
-        }
+    }
 
+    private func lifecycleReferences(now: Date, includeAll: Bool) -> [CodexActivityTurnReference] {
+        var references = tasks.values.compactMap(\.turnReference)
+        references.append(contentsOf: subagentLifecycleReferences())
+        let due = pendingTerminalTasks.filter { includeAll || $0.value.nextPollAt <= now }
+            .sorted { $0.value.nextPollAt < $1.value.nextPollAt }
+        for (key, var pending) in due.prefix(16) {
+            if let reference = pending.task.turnReference {
+                references.append(reference)
+            }
+            pending.nextPollAt = now.addingTimeInterval(now < pending.deadline ? 1 : 30)
+            pendingTerminalTasks[key] = pending
+        }
+        return references
+    }
+
+    @discardableResult
+    private func reconcileSessionLifecycles(
+        generation: UInt64,
+        recovering: Bool = false,
+        terminalOnly: Bool = false
+    ) async -> Bool {
+        guard generation == tailReaderGeneration, tailReader != nil, !isBootstrapping,
+              terminalOnly || isActivitySourceHealthy, !isSystemSleeping,
+              recovering || terminalOnly || !isActivityProtectionRecoveryInProgress,
+              !isReconcilingLifecycles else { return false }
+        isReconcilingLifecycles = true
+        defer { isReconcilingLifecycles = false }
+        let bootstrapGeneration = bootstrapCompletionGeneration
+        let recoveryGeneration = activityProtectionRecoveryGeneration
+        let references = lifecycleReferences(now: Date(), includeAll: recovering)
+        let states = await sessionLifecycleReader.lifecycleStates(for: references)
+        guard !Task.isCancelled, generation == tailReaderGeneration,
+              bootstrapGeneration == bootstrapCompletionGeneration,
+              recoveryGeneration == activityProtectionRecoveryGeneration,
+              tailReader != nil, !isBootstrapping, terminalOnly || isActivitySourceHealthy,
+              !isSystemSleeping else { return false }
         var didChange = false
         var transitions: [CodexActivityTransition] = []
         for state in states {
-            didChange = applyLifecycleState(state, into: &transitions) || didChange
+            didChange = applySubagentLifecycle(state, terminalOnly: terminalOnly, into: &transitions) || didChange
+            didChange = applyLifecycleState(state, terminalOnly: terminalOnly, into: &transitions) || didChange
         }
-
+        if !terminalOnly {
+            didChange = replayAssociatedSubagentEvents(into: &transitions) || didChange
+        }
         if didChange {
             refreshSnapshot(now: Date())
         }
-        for transition in transitions {
-            transitionSubject.send(transition)
+        if canPublishActivityTransitions {
+            for transition in transitions {
+                if case let .waitingApproval(snapshot) = transition,
+                   !tasks.values.contains(where: { $0.displayID == snapshot.id && $0.state == .waitingApproval }) {
+                    continue
+                }
+                transitionSubject.send(transition)
+            }
         }
+        return true
+    }
+
+    var canPublishActivityTransitions: Bool {
+        !isBootstrapping && !isActivityProtectionRecoveryInProgress && isActivitySourceHealthy
     }
 
     // MARK: - Hook 事件消费
@@ -449,6 +511,8 @@ final class CodexActivityMonitor: ObservableObject {
     private func consume(_ batch: HookEventBatch) {
         switch batch {
         case .bootstrapStart:
+            recoveryTask?.cancel()
+            recoveryTask = nil
             // 重试会重放整段历史, 计时从第一次开始算才是用户等到的总时长
             if !isBootstrapping {
                 bootstrapDuration = LogDuration()
@@ -479,41 +543,47 @@ final class CodexActivityMonitor: ObservableObject {
         case let .live(events):
             let pendingKeysBefore = Set(pendingTerminalTasks.keys)
             let activeCountBefore = snapshot.activeCount
-            var transitions: [CodexActivityLiveTransition] = []
+            var waitingTaskKeys: [CodexActivityTaskKey] = []
             for event in events {
-                if let transition = apply(event, source: .live) {
-                    transitions.append(transition)
+                if let key = apply(event, source: .live) {
+                    waitingTaskKeys.append(key)
                 }
             }
 
             refreshSnapshot(now: Date())
-            // 活跃数变化覆盖任务起止, transitions 覆盖等待批准
+            // 活跃数变化覆盖任务起止, waitingTaskKeys 覆盖等待批准
             // 只看活跃数会漏掉 running 转 waitingApproval, 那一进一出恒抵消为零
             let activeCountAfter = snapshot.activeCount
-            if activeCountAfter != activeCountBefore || !transitions.isEmpty {
+            if activeCountAfter != activeCountBefore || !waitingTaskKeys.isEmpty {
                 let details = LogFields.joined(
                     "from=\(activeCountBefore)",
                     "to=\(activeCountAfter)",
-                    "transitions=\(transitions.count)"
+                    "transitions=\(waitingTaskKeys.count)"
                 )
                 AppLog.activity.notice("任务数变化: \(details, privacy: .public)")
             }
-            publishLiveTransitions(transitions)
+            publishWaitingApprovalTransitions(waitingTaskKeys)
             if !pendingTerminalTasks.isEmpty {
                 // 只有刚进入终态确认窗口的任务需要重置解析缓存重试定位 rollout
                 // 窗口期内的后续批次只做即时查询, 避免反复递归扫描 sessions
                 let hasNewPendingTasks = !Set(pendingTerminalTasks.keys)
                     .subtracting(pendingKeysBefore).isEmpty
                 refreshSessionLifecycleNow(resetsResolutionFallbacks: hasNewPendingTasks)
+            } else if events.contains(where: { $0.hookEvent == .stop }) {
+                refreshSessionLifecycleNow()
             }
         case let .sourceHealthChanged(isHealthy):
             guard isHealthy != isActivitySourceHealthy else {
                 return
             }
             isActivitySourceHealthy = isHealthy
+            resetTerminalPresentationEvents()
             if isHealthy {
-                reconcileActivityProtection(now: Date(), sendsNotification: false)
+                if !isBootstrapping {
+                    requestActivityRecovery()
+                }
             } else {
+                beginActivityProtectionRecovery()
                 cancelInactivityCheck()
                 cancelAllActivityProtectionAttempts()
                 AppLog.activity.error(
@@ -528,18 +598,21 @@ final class CodexActivityMonitor: ObservableObject {
         attempts: Int,
         completionGeneration: UInt64
     ) async {
+        let recoveryGeneration = activityProtectionRecoveryGeneration
         if !degraded {
             let references = tasks.values.compactMap(\.turnReference)
                 + pendingTerminalTasks.values.compactMap(\.task.turnReference)
             if !references.isEmpty {
                 let states = await sessionLifecycleReader.lifecycleStates(for: references)
-                guard completionGeneration == bootstrapCompletionGeneration,
+                guard !Task.isCancelled, completionGeneration == bootstrapCompletionGeneration,
                       tailReader != nil else {
                     return
                 }
                 var ignoredTransitions: [CodexActivityTransition] = []
-                for state in states {
-                    _ = applyLifecycleState(state, into: &ignoredTransitions)
+                if recoveryGeneration == activityProtectionRecoveryGeneration, isActivitySourceHealthy, !isSystemSleeping {
+                    for state in states {
+                        _ = applyLifecycleState(state, into: &ignoredTransitions)
+                    }
                 }
             }
         }
@@ -548,7 +621,15 @@ final class CodexActivityMonitor: ObservableObject {
               tailReader != nil else {
             return
         }
+        resetTerminalPresentationEvents()
         isBootstrapping = false
+        if isActivitySourceHealthy, !isSystemSleeping {
+            if recoveryGeneration == activityProtectionRecoveryGeneration {
+                finishActivityProtectionRecovery(generation: recoveryGeneration)
+            } else {
+                requestActivityRecovery()
+            }
+        }
         let now = Date()
         applyPersistedActivityProtection(now: now)
         reconcileActivityProtection(now: now, sendsNotification: false)
@@ -563,8 +644,8 @@ final class CodexActivityMonitor: ObservableObject {
                 "events=\(eventCount)",
                 "activeTasks=\(activeCount)",
                 "elapsed=\(elapsed)",
-                "reason=unstableBoundary",
-                "action=skipHistory"
+                "reason=incompleteHistory",
+                "action=pauseProtection"
             )
             AppLog.activity.notice("历史回放已降级: \(details, privacy: .public)")
             return
@@ -617,17 +698,21 @@ final class CodexActivityMonitor: ObservableObject {
         }
     }
 
-    private func apply(
+    func apply(
         _ event: WorkflowHookEvent,
         source: CodexActivityEventSource
-    ) -> CodexActivityLiveTransition? {
-        guard !shouldIgnoreForActivity(event, source: source) else {
+    ) -> CodexActivityTaskKey? {
+        guard let event = activityEvent(from: event, source: source) else {
             return nil
         }
 
+        if deferUnassociatedSubagentEvent(event, source: source) {
+            return nil
+        }
         let isTopLevelEvent = event.agentId == nil
         switch event.hookEvent {
         case .userPromptSubmit:
+            guard isTopLevelEvent else { return nil }
             startTask(from: event, source: source)
         case .preToolUse:
             resumeTask(
@@ -668,8 +753,14 @@ final class CodexActivityMonitor: ObservableObject {
             guard isTopLevelEvent else {
                 return nil
             }
-            return completeTask(from: event)
+            observeStop(from: event, source: source)
+        case .interrupt:
+            guard isTopLevelEvent else {
+                return nil
+            }
+            interruptTask(from: event, source: source)
         case .sessionEnd:
+            guard isTopLevelEvent else { return nil }
             terminateSession(from: event)
         case .sessionStart, .none:
             break
@@ -684,17 +775,29 @@ final class CodexActivityMonitor: ObservableObject {
         source: CodexActivityEventSource
     ) {
         let key = CodexActivityTaskKey(event: event)
+        guard !updateAliasedPrompt(from: event, key: key) else { return }
+        preserveSupersededSessionTask(from: event, key: key)
+        if let pending = pendingTerminalTasks[key] {
+            guard key.turnId == nil, event.timestamp > pending.supersededAt else { return }
+            pendingTerminalTasks.removeValue(forKey: key)
+            if let resolved = pending.task.resolvedTurnKey {
+                pendingTerminalTasks[resolved] = pending
+            }
+        }
+        if pendingTerminalTasks.values.contains(where: { $0.task.resolvedTurnKey == key }) {
+            return
+        }
         let existingTask = tasks[key]
         let displayID = existingTask?.displayID ?? UUID()
-        if let completedAt = recentCompletionDate(for: key),
-           event.timestamp <= completedAt {
-            return
+        if let endedAt = recentEndedDate(for: key) {
+            if case .turn = key {
+                return
+            }
+            if event.timestamp <= endedAt {
+                return
+            }
         }
-        if let terminatedAt = recentTerminationDate(for: key),
-           event.timestamp <= terminatedAt {
-            return
-        }
-        if let existing = tasks[key], event.timestamp < existing.lastActivityAt {
+        if let existing = tasks[key], event.timestamp < existing.lastMainHookEventAt {
             return
         }
 
@@ -702,7 +805,7 @@ final class CodexActivityMonitor: ObservableObject {
             // 同一 session 的 turn 按顺序执行. 新 prompt 让旧 turn 立即退出活动列表
             // 但保留短暂终态确认窗口, 避免把迟到的正常完成误记为终止
             guard !tasks.values.contains(where: {
-                $0.key.sessionId == sessionId && $0.lastActivityAt > event.timestamp
+                $0.key.sessionId == sessionId && $0.lastMainHookEventAt > event.timestamp
             }) else {
                 return
             }
@@ -710,8 +813,7 @@ final class CodexActivityMonitor: ObservableObject {
                 $0.key != key && $0.key.sessionId == sessionId
             }
             for task in supersededTasks {
-                cancelActivityProtectionAttempt(for: task.key)
-                invalidateActivityProtectionNotification(for: task.displayID)
+                clearActivityProtection(for: task.key, taskID: task.displayID, reason: .terminal)
                 pendingTerminalTasks[task.key] = PendingTerminalTask(
                     task: task,
                     supersededAt: event.timestamp,
@@ -731,15 +833,17 @@ final class CodexActivityMonitor: ObservableObject {
             )
         }
 
-        recentlyCompletedTaskAt.removeValue(forKey: key)
-        recentlyTerminatedTaskAt.removeValue(forKey: key)
+        recentlyEndedTaskAt.removeValue(forKey: key)
         if let sessionId = key.sessionId {
-            // 缺少 turn 的 Stop 会使用 session 键; 新 turn 开始后允许该键再次完成
-            recentlyCompletedTaskAt.removeValue(forKey: .session(sessionId))
-            recentlyTerminatedTaskAt.removeValue(forKey: .session(sessionId))
+            // 缺少 turn 的事件复用 session 键; 新 turn 开始后清除上一轮的终态记忆
+            recentlyEndedTaskAt.removeValue(forKey: .session(sessionId))
         }
 
-        tasks[key] = CodexActivityTask(
+        if resumePromptInSameTurn(from: event, existing: existingTask) {
+            return
+        }
+
+        var task = CodexActivityTask(
             displayID: displayID,
             key: key,
             event: event,
@@ -748,6 +852,8 @@ final class CodexActivityMonitor: ObservableObject {
             startedAt: event.timestamp,
             progressGeneration: (existingTask?.progressGeneration ?? 0) &+ 1
         )
+        task.lastProgressAt = max(task.lastProgressAt, existingTask?.lastProgressAt ?? .distantPast)
+        tasks[key] = task
     }
 
     private func resumeTask(
@@ -762,24 +868,18 @@ final class CodexActivityMonitor: ObservableObject {
             : matchingSubagentParentTaskKey(for: event)
 
         if let key = matchedKey, var task = tasks[key] {
-            guard recentCompletionDate(for: key) == nil,
-                  recentTerminationDate(for: key) == nil,
+            guard recentEndedDate(for: key) == nil,
                   pendingTerminalTasks[key] == nil else {
                 return
             }
-            guard event.timestamp >= task.lastActivityAt else {
+            guard task.acceptsExecutionEvent(event) else {
                 return
             }
 
             let wasSuppressed = task.state == .suppressed
-            if task.state != .running {
-                task.state = .running
-                task.stateChangedAt = event.timestamp
-            }
-            task.pendingApprovalRequestedAt = nil
-            task.latestEvent = latestEvent
+            task.resumeExecution(from: event, latestEvent: latestEvent)
             task.mergeMetadata(from: event)
-            task.recordProgress(at: event.timestamp)
+            task.recordHookEvent(at: event.timestamp)
             tasks[key] = task
             if wasSuppressed || source == .live {
                 clearActivityProtection(
@@ -792,9 +892,9 @@ final class CodexActivityMonitor: ObservableObject {
         }
 
         guard allowsRecovery,
-              recentCompletionDate(for: eventKey) == nil,
-              recentTerminationDate(for: eventKey) == nil,
-              pendingTerminalTasks[eventKey] == nil else {
+              recentEndedDate(for: eventKey) == nil,
+              pendingTerminalTasks[eventKey] == nil,
+              !pendingTerminalTasks.values.contains(where: { $0.task.resolvedTurnKey == eventKey }) else {
             return
         }
 
@@ -823,14 +923,13 @@ final class CodexActivityMonitor: ObservableObject {
         source: CodexActivityEventSource
     ) {
         guard let key = matchingSubagentParentTaskKey(for: event),
-              recentCompletionDate(for: key) == nil,
-              recentTerminationDate(for: key) == nil,
+              recentEndedDate(for: key) == nil,
               pendingTerminalTasks[key] == nil,
               var task = tasks[key] else {
             return
         }
 
-        // 子 Agent 只能按 session 关联父任务, 忽略上一 turn 延迟到达的事件
+        // 归属已精确关联, 仍拒绝早于根任务起点的事件
         if let startedAt = task.startedAt, event.timestamp < startedAt {
             return
         }
@@ -838,25 +937,17 @@ final class CodexActivityMonitor: ObservableObject {
         task.recordSubagentActivity(
             agentId: event.agentId,
             isStarting: isStarting,
+            hasEnded: task.executions[task.executionKey(for: event)]?.isTerminal == true,
             at: event.timestamp
         )
 
-        if event.timestamp >= task.lastActivityAt {
+        if task.acceptsExecutionEvent(event) {
             let wasSuppressed = task.state == .suppressed
-            if task.state != .running {
-                task.state = .running
-                task.stateChangedAt = event.timestamp
-            }
-            task.pendingApprovalRequestedAt = nil
-            task.latestEvent = isStarting ? .subagentStarted : .subagentFinished
+            task.resumeExecution(from: event, latestEvent: isStarting ? .subagentStarted : .subagentFinished)
             task.mergeMetadata(from: event)
-            task.recordProgress(at: event.timestamp)
+            task.recordHookEvent(at: event.timestamp)
             if wasSuppressed || source == .live {
-                clearActivityProtection(
-                    for: key,
-                    taskID: task.displayID,
-                    reason: .progress
-                )
+                clearActivityProtection(for: key, taskID: task.displayID, reason: .progress)
             }
         }
         tasks[key] = task
@@ -865,19 +956,18 @@ final class CodexActivityMonitor: ObservableObject {
     private func waitForApproval(
         from event: WorkflowHookEvent,
         source: CodexActivityEventSource
-    ) -> CodexActivityLiveTransition? {
+    ) -> CodexActivityTaskKey? {
         let eventKey = CodexActivityTaskKey(event: event)
         let matchedKey = event.agentId == nil
             ? matchingActiveTaskKey(for: event)
             : matchingSubagentParentTaskKey(for: event)
 
         if let key = matchedKey, var task = tasks[key] {
-            guard recentCompletionDate(for: key) == nil,
-                  recentTerminationDate(for: key) == nil,
+            guard recentEndedDate(for: key) == nil,
                   pendingTerminalTasks[key] == nil else {
                 return nil
             }
-            guard event.timestamp >= task.lastActivityAt else {
+            guard task.acceptsExecutionEvent(event) else {
                 return nil
             }
 
@@ -885,8 +975,8 @@ final class CodexActivityMonitor: ObservableObject {
             task.mergeMetadata(from: event)
             // 权限事件描述当前请求; 缺失工具名时不能沿用上一条工具事件
             task.toolName = event.toolName
-            task.recordProgress(at: event.timestamp)
-            let enteredWaiting = task.recordApprovalRequest(at: event.timestamp)
+            task.recordHookEvent(at: event.timestamp)
+            let enteredWaiting = task.recordApprovalRequest(from: event)
             tasks[key] = task
             if wasSuppressed || source == .live {
                 clearActivityProtection(
@@ -895,13 +985,13 @@ final class CodexActivityMonitor: ObservableObject {
                     reason: .progress
                 )
             }
-            return enteredWaiting ? .waitingApproval(key) : nil
+            return enteredWaiting ? key : nil
         }
 
         guard event.agentId == nil,
-              recentCompletionDate(for: eventKey) == nil,
-              recentTerminationDate(for: eventKey) == nil,
-              pendingTerminalTasks[eventKey] == nil else {
+              recentEndedDate(for: eventKey) == nil,
+              pendingTerminalTasks[eventKey] == nil,
+              !pendingTerminalTasks.values.contains(where: { $0.task.resolvedTurnKey == eventKey }) else {
             return nil
         }
 
@@ -914,7 +1004,7 @@ final class CodexActivityMonitor: ObservableObject {
             startedAt: nil,
             progressGeneration: 1
         )
-        let enteredWaiting = task.recordApprovalRequest(at: event.timestamp)
+        let enteredWaiting = task.recordApprovalRequest(from: event)
         tasks[eventKey] = task
         if source == .live {
             clearActivityProtection(
@@ -923,95 +1013,41 @@ final class CodexActivityMonitor: ObservableObject {
                 reason: .progress
             )
         }
-        return enteredWaiting ? .waitingApproval(eventKey) : nil
+        return enteredWaiting ? eventKey : nil
     }
 
-    private func completeTask(from event: WorkflowHookEvent) -> CodexActivityLiveTransition? {
+    /// Stop handler 仍可要求同一 turn 继续执行, 完成只由 rollout terminal 确认
+    private func observeStop(from event: WorkflowHookEvent, source: CodexActivityEventSource) {
         let eventKey = CodexActivityTaskKey(event: event)
-        guard recentCompletionDate(for: eventKey) == nil else {
-            // 清掉旧版本或异常顺序留下的同键恢复任务
+        guard recentEndedDate(for: eventKey) == nil else {
             discardStaleTerminalTask(for: eventKey)
-            return nil
-        }
-        guard recentTerminationDate(for: eventKey) == nil else {
-            discardStaleTerminalTask(for: eventKey)
-            return nil
+            return
         }
 
-        let match = matchingTerminalTask(for: event)
-        if case .ambiguous = match {
-            AppLog.activity.error(
-                "任务终态已延后: reason=ambiguousStop"
-            )
-            return nil
-        }
-
-        if case let .pending(key) = match,
-           let pending = pendingTerminalTasks[key] {
-            guard event.timestamp >= pending.task.lastActivityAt else {
-                return nil
+        let match = matchingTerminalTask(for: event, allowsAnonymousFallback: event.sessionId == nil)
+        switch match {
+        case .ambiguous:
+            AppLog.activity.error("任务终态已延后: reason=ambiguousStop")
+        case let .pending(key):
+            guard var pending = pendingTerminalTasks[key],
+                  event.timestamp >= pending.task.lastMainHookEventAt else {
+                return
             }
-            pendingTerminalTasks.removeValue(forKey: key)
-            clearActivityProtection(
-                for: key,
-                taskID: pending.task.displayID,
-                reason: .terminal
-            )
-            let completion = storeResolvedCompletion(
-                pending.task,
-                key: key,
-                completedAt: event.timestamp,
-                reportedDuration: nil,
-                projectName: event.projectDisplayName,
-                modelName: event.modelName,
-                effort: event.effort
-            )
-            recordCompletedTask(eventKey, at: event.timestamp)
-            return .completed(completion)
-        }
-
-        let matchedKey: CodexActivityTaskKey? = switch match {
-        case let .active(key): key
-        default: nil
-        }
-        let task = matchedKey.flatMap { tasks[$0] }
-        if let task, event.timestamp < task.lastActivityAt {
-            return nil
-        }
-
-        let key = matchedKey ?? eventKey
-        guard recentCompletionDate(for: key) == nil else {
-            if let matchedKey {
-                tasks.removeValue(forKey: matchedKey)
-            }
-            return nil
-        }
-
-        if let matchedKey {
-            tasks.removeValue(forKey: matchedKey)
-            clearActivityProtection(
-                for: matchedKey,
-                taskID: task?.displayID,
-                reason: .terminal
+            // 新 turn 或 SessionEnd 已确定旧任务退出活动列表, Stop 不恢复它或重置 grace
+            pending.task.mergeMetadata(from: event)
+            pending.task.recordHookEvent(at: event.timestamp)
+            pendingTerminalTasks[key] = pending
+        case .active, .none:
+            resumeTask(
+                from: event,
+                latestEvent: .stopRequested,
+                allowsRecovery: true,
+                source: source
             )
         }
-
-        let duration = task?.preciseDuration(until: event.timestamp)
-
-        let completion = storeCompletion(
-            for: key,
-            projectName: event.projectDisplayName ?? task?.projectName,
-            modelName: event.modelName ?? task?.modelName,
-            effort: event.effort ?? task?.effort,
-            completedAt: event.timestamp,
-            duration: duration
-        )
-        recordCompletedTask(eventKey, at: event.timestamp)
-        recordCompletedTask(key, at: event.timestamp)
-        return .completed(completion)
     }
 
-    private func discardStaleTerminalTask(for key: CodexActivityTaskKey) {
+    func discardStaleTerminalTask(for key: CodexActivityTaskKey) {
         if let task = tasks.removeValue(forKey: key) {
             clearActivityProtection(
                 for: key,
@@ -1037,7 +1073,7 @@ final class CodexActivityMonitor: ObservableObject {
 
         let deadline = Date().addingTimeInterval(Self.supersededTerminalGracePeriod)
         let matchingPendingTasks = pendingTerminalTasks.filter { key, pending in
-            key.sessionId == sessionId && pending.task.lastActivityAt <= event.timestamp
+            key.sessionId == sessionId && pending.task.lastMainHookEventAt <= event.timestamp
         }
         for (key, pending) in matchingPendingTasks {
             pendingTerminalTasks[key] = PendingTerminalTask(
@@ -1048,12 +1084,11 @@ final class CodexActivityMonitor: ObservableObject {
         }
 
         let matchingActiveTasks = tasks.filter { key, task in
-            key.sessionId == sessionId && task.lastActivityAt <= event.timestamp
+            key.sessionId == sessionId && task.lastMainHookEventAt <= event.timestamp
         }
         for (key, task) in matchingActiveTasks {
             tasks.removeValue(forKey: key)
-            cancelActivityProtectionAttempt(for: key)
-            invalidateActivityProtectionNotification(for: task.displayID)
+            clearActivityProtection(for: key, taskID: task.displayID, reason: .terminal)
             pendingTerminalTasks[key] = PendingTerminalTask(
                 task: task,
                 supersededAt: event.timestamp,
@@ -1065,6 +1100,9 @@ final class CodexActivityMonitor: ObservableObject {
     /// 精确 turn 失败后只接受同 session 唯一活动任务, 有待确认旧 turn 时不猜测
     private func matchingActiveTaskKey(for event: WorkflowHookEvent) -> CodexActivityTaskKey? {
         let exactKey = CodexActivityTaskKey(event: event)
+        if let key = tasks.first(where: { $0.value.resolvedTurnKey == exactKey })?.key {
+            return key
+        }
         if tasks[exactKey] != nil {
             return exactKey
         }
@@ -1077,7 +1115,7 @@ final class CodexActivityMonitor: ObservableObject {
             }
             let candidates = tasks.values.filter { task in
                 task.key.sessionId == sessionId
-                    && (event.turnId == nil || task.key.isSessionOnly)
+                    && (event.turnId == nil || task.associatedTurnId == nil)
             }
             guard candidates.count == 1 else {
                 return nil
@@ -1091,27 +1129,17 @@ final class CodexActivityMonitor: ObservableObject {
         return tasks[anonymousKey] == nil ? nil : anonymousKey
     }
 
-    /// 子 Agent 的 turn_id 属于它自己, 只能在没有待确认旧 turn 时关联同 session 唯一父任务
-    private func matchingSubagentParentTaskKey(
-        for event: WorkflowHookEvent
-    ) -> CodexActivityTaskKey? {
-        guard let sessionId = event.sessionId,
-              !pendingTerminalTasks.values.contains(where: {
-                  $0.task.key.sessionId == sessionId
-              }) else {
-            return nil
-        }
-        let candidates = tasks.values.filter { $0.key.sessionId == sessionId }
-        guard candidates.count == 1 else {
-            return nil
-        }
-        return candidates[0].key
-    }
-
-    private func matchingTerminalTask(
-        for event: WorkflowHookEvent
+    func matchingTerminalTask(
+        for event: WorkflowHookEvent,
+        allowsAnonymousFallback: Bool = true
     ) -> CodexTerminalTaskMatch {
         let exactKey = CodexActivityTaskKey(event: event)
+        if let key = pendingTerminalTasks.first(where: { $0.value.task.resolvedTurnKey == exactKey })?.key {
+            return .pending(key)
+        }
+        if let key = tasks.first(where: { $0.value.resolvedTurnKey == exactKey })?.key {
+            return .active(key)
+        }
         if pendingTerminalTasks[exactKey] != nil {
             return .pending(exactKey)
         }
@@ -1121,13 +1149,13 @@ final class CodexActivityMonitor: ObservableObject {
         }
 
         if let sessionId = event.sessionId {
-            let pendingCandidates = pendingTerminalTasks.values.filter {
-                $0.task.key.sessionId == sessionId
-                    && $0.task.lastActivityAt <= event.timestamp
-                    && (event.turnId == nil || $0.task.key.isSessionOnly)
+            let pendingCandidates = pendingTerminalTasks.filter {
+                $0.value.task.key.sessionId == sessionId
+                    && $0.value.task.lastMainHookEventAt <= event.timestamp
+                    && (event.turnId == nil || $0.value.task.associatedTurnId == nil)
             }
-            if pendingCandidates.count == 1 {
-                return .pending(pendingCandidates[0].task.key)
+            if pendingCandidates.count == 1, let key = pendingCandidates.keys.first {
+                return .pending(key)
             }
             if pendingCandidates.count > 1 {
                 return .ambiguous
@@ -1135,8 +1163,8 @@ final class CodexActivityMonitor: ObservableObject {
 
             let activeCandidates = tasks.values.filter {
                 $0.key.sessionId == sessionId
-                    && $0.lastActivityAt <= event.timestamp
-                    && (event.turnId == nil || $0.key.isSessionOnly)
+                    && $0.lastMainHookEventAt <= event.timestamp
+                    && (event.turnId == nil || $0.associatedTurnId == nil)
             }
             if activeCandidates.count == 1 {
                 return .active(activeCandidates[0].key)
@@ -1146,6 +1174,9 @@ final class CodexActivityMonitor: ObservableObject {
             }
         }
 
+        guard allowsAnonymousFallback else {
+            return .none
+        }
         let anonymousKey = CodexActivityTaskKey.anonymous(
             project: CodexActivityTaskKey.projectIdentifier(event.projectDisplayName)
         )
@@ -1174,8 +1205,14 @@ final class CodexActivityMonitor: ObservableObject {
             recentCompletions: recentCompletions,
             recentTerminations: recentTerminations
         )
-        if newSnapshot != snapshot {
+        let events = pendingTerminalPresentationEvents.filter { terminalTaskKeyByID[$0.id] != nil }
+        pendingTerminalPresentationEvents.removeAll()
+        let didChange = newSnapshot != snapshot
+        if didChange {
             snapshot = newSnapshot
+        }
+        if didChange || !events.isEmpty {
+            presentationSubject.send(CodexActivityPresentationUpdate(snapshot: newSnapshot, terminalEvents: events))
         }
 
         scheduleNextCleanup(now: now)
@@ -1225,15 +1262,12 @@ final class CodexActivityMonitor: ObservableObject {
             retainedTerminalIDs.contains($0.key)
         }
 
-        let completedTaskCutoff = now.addingTimeInterval(-Self.completedTaskRetention)
-        recentlyCompletedTaskAt = recentlyCompletedTaskAt.filter {
-            $0.value > completedTaskCutoff
+        let endedTaskCutoff = now.addingTimeInterval(-Self.endedTaskRetention)
+        recentlyEndedTaskAt = recentlyEndedTaskAt.filter {
+            $0.value > endedTaskCutoff
         }
-        recentlyTerminatedTaskAt = recentlyTerminatedTaskAt.filter {
-            $0.value > completedTaskCutoff
-        }
-        ignoredAutoReviewTaskAt = ignoredAutoReviewTaskAt.filter {
-            $0.value > activityCutoff
+        activityTaskOrigins = activityTaskOrigins.filter {
+            $0.value.observedAt > activityCutoff
         }
     }
 
@@ -1247,15 +1281,12 @@ final class CodexActivityMonitor: ObservableObject {
         deadlines.append(contentsOf: terminations.map {
             $0.terminatedAt.addingTimeInterval(Self.recentHistoryRetention)
         })
-        deadlines.append(contentsOf: pendingTerminalTasks.values.map(\.deadline))
-        deadlines.append(contentsOf: recentlyCompletedTaskAt.values.map {
-            $0.addingTimeInterval(Self.completedTaskRetention)
+        deadlines.append(contentsOf: pendingTerminalTasks.values.map(\.expiresAt))
+        deadlines.append(contentsOf: recentlyEndedTaskAt.values.map {
+            $0.addingTimeInterval(Self.endedTaskRetention)
         })
-        deadlines.append(contentsOf: recentlyTerminatedTaskAt.values.map {
-            $0.addingTimeInterval(Self.completedTaskRetention)
-        })
-        deadlines.append(contentsOf: ignoredAutoReviewTaskAt.values.map {
-            $0.addingTimeInterval(Self.activityRetention)
+        deadlines.append(contentsOf: activityTaskOrigins.values.map {
+            $0.observedAt.addingTimeInterval(Self.activityRetention)
         })
         deadlines.append(contentsOf: activityProtectionRecords.values.map(\.expiresAt))
 
@@ -1283,9 +1314,46 @@ final class CodexActivityMonitor: ObservableObject {
     }
 
     private static let recentHistoryRetention = CodexActivityRetention.recentHistory
-    static let completedTaskRetention: TimeInterval = 24 * 60 * 60
+    static let endedTaskRetention: TimeInterval = 24 * 60 * 60
     static let activityRetention = CodexActivityRetention.window
     static let activityProtectionNotificationSubmissionGrace: Duration = .seconds(3)
     private static let supersededTerminalGracePeriod: TimeInterval = 5
     private static let sessionLifecyclePollInterval: TimeInterval = 1
+}
+
+private extension CodexActivityMonitor {
+    func resumePromptInSameTurn(from event: WorkflowHookEvent, existing: CodexActivityTask?) -> Bool {
+        guard var task = existing, let turnId = event.turnId, task.associatedTurnId == turnId else { return false }
+        task.resumeExecution(from: event, latestEvent: .promptSubmitted)
+        task.mergeMetadata(from: event)
+        task.recordHookEvent(at: event.timestamp)
+        task.startedAt = task.startedAt ?? event.timestamp
+        tasks[task.key] = task
+        return true
+    }
+
+    func preserveSupersededSessionTask(from event: WorkflowHookEvent, key: CodexActivityTaskKey) {
+        if let existing = tasks[key], key.isSessionOnly,
+           let resolved = existing.resolvedTurnKey,
+           event.timestamp > (existing.startedAt ?? existing.lastHookEventAt) {
+            pendingTerminalTasks[resolved] = PendingTerminalTask(
+                task: existing,
+                supersededAt: event.timestamp,
+                deadline: Date().addingTimeInterval(Self.supersededTerminalGracePeriod)
+            )
+        }
+    }
+
+    func updateAliasedPrompt(from event: WorkflowHookEvent, key: CodexActivityTaskKey) -> Bool {
+        guard let existing = tasks.values.first(where: { $0.resolvedTurnKey == key && $0.key != key }) else {
+            return false
+        }
+        guard event.timestamp >= existing.lastMainHookEventAt else { return true }
+        var task = existing
+        task.mergeMetadata(from: event)
+        task.recordExecutionEvent(event)
+        task.recordHookEvent(at: event.timestamp)
+        tasks[existing.key] = task
+        return true
+    }
 }

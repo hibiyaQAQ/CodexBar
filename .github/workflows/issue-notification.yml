@@ -1,0 +1,28 @@
+name: Issue notification
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    if: github.repository == 'yatotm/CodexBar' && (github.event_name != 'issue_comment' || github.event.issue.pull_request == null)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Send Bark notification
+        env:
+          BARK_TOKEN: ${{ secrets.BARK_TOKEN }}
+          BARK_SERVER_URL: ${{ secrets.BARK_SERVER_URL }}
+          BARK_ICON_URL: ${{ secrets.BARK_ICON_URL }}
+          SELF_LOGIN: ${{ vars.SELF_LOGIN || github.repository_owner }}
+        run: python3 -B Scripts/notify-issue.py

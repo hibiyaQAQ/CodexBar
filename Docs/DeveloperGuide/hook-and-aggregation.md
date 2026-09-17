@@ -24,7 +24,7 @@ Codex Hook
 启用流程检查以下条件，其中来源、信任和事件完整性在写入后校验：
 
 - 当前可执行文件路径可解析
-- 实际 app-server 版本不低于 `0.145.0`
+- 实际 app-server 版本不低于 `0.150.0`
 - `features.hooks` 可用
 - `hooks/list` 返回可信来源
 - 所需事件集合完整
@@ -61,7 +61,7 @@ App 启动、设置状态刷新、菜单面板打开以及每轮额度刷新完�
 ### 启用事务的顺序
 
 ```text
-确认运行中 app-server >= 0.145.0
+确认运行中 app-server >= 0.150.0
   -> 确认 features.hooks 没有全局关闭
   -> 读取现有 hooks.json
   -> 只移除当前 executable 的旧 CodexBar handler
@@ -398,7 +398,7 @@ compaction 和 subagent 成对事件使用相同规则。
 
 ## Schema 演进与重建
 
-当前聚合 schema 为 `6`，由 `WorkflowMaintenanceState.currentAggregationSchema` 管理。
+当前聚合 schema 为 `9`，由 `WorkflowMaintenanceState.currentAggregationSchema` 管理。
 
 以下变化必须递增 schema：
 

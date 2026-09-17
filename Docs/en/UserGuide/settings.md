@@ -89,3 +89,7 @@ Back to the [User Guide](README.md).
 ## Fork behavior
 
 Usage Details opens separate source, refresh, account-history, and valuation controls. The GitHub link opens yatotm/CodexBar. Release updates use this fork’s feed; Debug builds do not use that channel.
+
+## Task glow
+
+Task glow is optional and off by default. Enable it in Settings > General to show running, approval, completion and termination feedback along the top of each display. It uses combined Codex and Claude activity from local and enabled remote sources, independently of the panel tab. A single preview plays when enabled. The overlay is removed during system sleep, display sleep and user-session switching.

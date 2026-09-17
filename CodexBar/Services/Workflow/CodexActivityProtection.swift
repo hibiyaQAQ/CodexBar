@@ -43,6 +43,8 @@ extension CodexActivityMonitor {
     func beginActivityProtectionRecovery() -> UInt64 {
         activityProtectionRecoveryGeneration &+= 1
         isActivityProtectionRecoveryInProgress = true
+        sessionTransitionNotBefore = nil
+        resetTerminalPresentationEvents()
         cancelInactivityCheck()
         cancelAllActivityProtectionAttempts()
         return activityProtectionRecoveryGeneration
@@ -52,7 +54,9 @@ extension CodexActivityMonitor {
         guard generation == activityProtectionRecoveryGeneration else {
             return
         }
+        resetTerminalPresentationEvents()
         isActivityProtectionRecoveryInProgress = false
+        sessionTransitionNotBefore = Date()
         reconcileActivityProtection(now: Date(), sendsNotification: false)
     }
 
@@ -65,12 +69,13 @@ extension CodexActivityMonitor {
     func applyPersistedActivityProtection(now: Date) {
         removeExpiredActivityProtectionRecords(now: now)
 
-        guard isActivityProtectionEnabled else {
+        guard canEvaluateActivityProtection else {
             return
         }
 
         for (key, var task) in tasks {
-            guard let identifier = key.activityProtectionIdentifier,
+            guard task.hasFreshLifecycle(at: now),
+                  let identifier = key.activityProtectionIdentifier,
                   let record = activityProtectionRecords[identifier] else {
                 continue
             }
@@ -109,7 +114,7 @@ extension CodexActivityMonitor {
         let restorableKeys = tasks.compactMap { key, task -> CodexActivityTaskKey? in
             guard !key.isAnonymous,
                   task.state == .suppressed,
-                  task.lastProgressAt.addingTimeInterval(threshold) > now else {
+                  task.activityProtectionReferenceAt.addingTimeInterval(threshold) > now else {
                 return nil
             }
             return key
@@ -121,7 +126,8 @@ extension CodexActivityMonitor {
         let overdueKeys = tasks.compactMap { key, task -> CodexActivityTaskKey? in
             guard !key.isAnonymous,
                   task.state == .running,
-                  task.lastProgressAt.addingTimeInterval(threshold) <= now else {
+                  let deadline = task.activityProtectionDeadline(at: now, inactivityDuration: threshold),
+                  deadline <= now else {
                 return nil
             }
             return key
@@ -145,7 +151,7 @@ extension CodexActivityMonitor {
                   activityProtectionAttempts[key] == nil else {
                 return nil
             }
-            return task.lastProgressAt.addingTimeInterval(threshold)
+            return task.activityProtectionDeadline(at: now, inactivityDuration: threshold)
         }.min()
 
         guard let nextDeadline else {
@@ -178,8 +184,7 @@ extension CodexActivityMonitor {
     }
 
     func beginDueInactivityChecks(now: Date) {
-        guard isActivityProtectionEnabled,
-              !isActivityProtectionRecoveryInProgress else {
+        guard canEvaluateActivityProtection else {
             refreshSnapshot(now: now)
             return
         }
@@ -189,7 +194,8 @@ extension CodexActivityMonitor {
             guard !key.isAnonymous,
                   task.state == .running,
                   activityProtectionAttempts[key] == nil,
-                  task.lastProgressAt.addingTimeInterval(threshold) <= now else {
+                  let deadline = task.activityProtectionDeadline(at: now, inactivityDuration: threshold),
+                  deadline <= now else {
                 return nil
             }
             return ActivityProtectionCandidate(
@@ -247,9 +253,7 @@ extension CodexActivityMonitor {
             taskID: candidate.taskID,
             attemptID: attemptID,
             projectName: candidate.projectName,
-            inactivityDurationText: candidate.inactivityDuration.title,
-            inactivityDurationSeconds: candidate.inactivityDuration.rawValue,
-            progressGeneration: candidate.progressGeneration
+            inactivityDurationText: candidate.inactivityDuration.title
         )
         let notificationHandler = onInactivityProtectionTriggered
         Task { @MainActor [weak self] in
@@ -331,16 +335,11 @@ extension CodexActivityMonitor {
         now: Date
     ) {
         guard !key.isAnonymous,
-              isStarted,
-              isActivityProtectionEnabled,
-              tailReader != nil,
-              !isBootstrapping,
-              isActivitySourceHealthy,
+              canEvaluateActivityProtection,
               let task = tasks[key],
               task.state == .running,
-              task.lastProgressAt.addingTimeInterval(
-                  activityProtectionSettings.inactivityDuration.timeInterval
-              ) <= now else {
+              let deadline = task.activityProtectionDeadline(at: now, inactivityDuration: activityProtectionSettings.inactivityDuration.timeInterval),
+              deadline <= now else {
             return
         }
         suppressActivityTaskSilently(key, markedAt: now)
@@ -402,36 +401,22 @@ extension CodexActivityMonitor {
               task.progressGeneration == candidate.progressGeneration else {
             return false
         }
-        return task.lastProgressAt
-            .addingTimeInterval(candidate.inactivityDuration.timeInterval) <= now
+        return task.activityProtectionDeadline(at: now, inactivityDuration: candidate.inactivityDuration.timeInterval)
+            .map { $0 <= now } == true
     }
 
     func isInactivityProtectionNoticeRelevant(
         taskID: UUID,
-        attemptID: UUID,
-        progressGeneration: UInt64,
-        inactivityDurationSeconds: Int
+        attemptID: UUID
     ) -> Bool {
-        guard canEvaluateActivityProtection,
-              activityProtectionSettings.inactivityDuration.rawValue == inactivityDurationSeconds,
-              activityProtectionNoticeAttemptIDs[taskID] == attemptID,
+        guard activityProtectionNoticeAttemptIDs[taskID] == attemptID,
               let attempt = activityProtectionAttempts.values.first(where: {
                   $0.id == attemptID && $0.candidate.taskID == taskID
               }) else {
             return false
         }
 
-        let now = Date()
-        guard !attempt.candidate.key.isAnonymous,
-              let task = tasks[attempt.candidate.key] else {
-            return false
-        }
-        return task.displayID == taskID
-            && task.state == .running
-            && task.progressGeneration == progressGeneration
-            && task.lastProgressAt.addingTimeInterval(
-                activityProtectionSettings.inactivityDuration.timeInterval
-            ) <= now
+        return isActivityProtectionCandidateRelevant(attempt.candidate, now: Date())
     }
 
     func shouldRestoreActivityProtection(

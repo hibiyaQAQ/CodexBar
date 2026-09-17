@@ -24,7 +24,7 @@ Raw events are the fact source; daily aggregation is a rebuildable cache. A chan
 The enable flow checks the following conditions, validating source, trust, and event completeness after writing:
 
 - A resolvable current executable path
-- Actual app-server version `0.145.0` or later
+- Actual app-server version `0.150.0` or later
 - Available `features.hooks`
 - A trusted source returned by `hooks/list`
 - A complete required event set
@@ -61,7 +61,7 @@ Reconciliation derives its work from the current required event set and actual f
 ### Enable Transaction Order
 
 ```text
-Confirm running app-server >= 0.145.0
+Confirm running app-server >= 0.150.0
   -> Confirm features.hooks is not globally disabled
   -> Read existing hooks.json
   -> Remove only old CodexBar handlers for this executable
@@ -398,7 +398,7 @@ This availability is retained in aggregate and sync fields; the current UI does 
 
 ## Schema Evolution and Rebuild
 
-The current aggregation schema is `6`, managed by `WorkflowMaintenanceState.currentAggregationSchema`.
+The current aggregation schema is `9`, managed by `WorkflowMaintenanceState.currentAggregationSchema`.
 
 Increment the schema for:
 

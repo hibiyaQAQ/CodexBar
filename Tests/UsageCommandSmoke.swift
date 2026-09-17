@@ -3,12 +3,16 @@ import Foundation
 
 @MainActor final class CodexActivityMonitor: ObservableObject {
     @Published var snapshot = CodexActivitySnapshot.empty
+    let presentationSubject = PassthroughSubject<CodexActivityPresentationUpdate, Never>()
+    var presentationPublisher: AnyPublisher<CodexActivityPresentationUpdate, Never> {
+        presentationSubject.eraseToAnyPublisher()
+    }
 }
 
 @MainActor final class UsageCenterViewModel: ObservableObject {
     @Published var sources = [UsageSource]()
     @Published var menuScope = UsageMenuScope.all
-    let remoteActivity = RemoteActivityController()
+    let remoteActivity = RemoteActivityController(defaults: UserDefaults(suiteName: "CodexBar.command-tests." + UUID().uuidString)!)
 }
 
 nonisolated enum CodexCLIResolver {
@@ -25,6 +29,7 @@ struct UsageCommandSmoke {
         verifyStatusItemLifetime()
         verifyTaskLayoutRestoration()
         verifyScopeIsolation()
+        verifyLiveTerminalBoundaries()
         let streamPipe = Pipe()
         try streamPipe.fileHandleForWriting.write(contentsOf: Data("small frame\n".utf8))
         let partial = try ActivityStreamClient.readChunk(from: streamPipe.fileHandleForReading.fileDescriptor)
@@ -58,6 +63,26 @@ struct UsageCommandSmoke {
             preconditionFailure("应拒绝超大响应")
         } catch is UsageCenterError {}
         print("Usage command pipe, timeout, cancellation and size tests passed")
+    }
+
+    static func verifyLiveTerminalBoundaries() {
+        for provider in ["codex", "claude"] {
+            let id = String(repeating: "a", count: 64)
+            let waiting = RemoteActivityTask(id: id, provider: provider, state: "waiting", project: "p", updatedAt: 20, startedAt: 1, modelName: "m", stateChangedAt: 3)
+            let source = UsageSource(id: "remote", name: "remote", address: "remote", includesClaude: true)
+            let merged = ActivityPresentationModel.merge(local: .empty, tasks: [source.id: [waiting]], states: [source.id: "实时连接"], enabled: [source.id], sources: [source], scope: .all, now: Date(timeIntervalSince1970: 21))
+            precondition(merged.waitingTasks.first?.stateChangedAt == Date(timeIntervalSince1970: 3), "新进展不能重置等待起点")
+            let previous = RemoteActivityTask(id: id, provider: provider, state: "running", project: "p", updatedAt: 10, startedAt: 1, modelName: "m")
+            let done = RemoteActivityTask(id: id, provider: provider, state: "completed", project: "p", updatedAt: 20, startedAt: 1, modelName: "m")
+            let frame = RemoteActivityFrame(schema: 1, epoch: String(repeating: "a", count: 32), revision: 2, sentAt: 21, tasks: [done])
+            precondition(RemoteActivityController.liveTerminals(previous: [previous], frame: frame, wasConnected: true).count == 1)
+            precondition(RemoteActivityController.liveTerminals(previous: [previous], frame: frame, wasConnected: false).isEmpty, "重连不得重播终态流光")
+            let stale = RemoteActivityFrame(schema: 1, epoch: frame.epoch, revision: 3, sentAt: 100, tasks: [done])
+            precondition(RemoteActivityController.liveTerminals(previous: [previous], frame: stale, wasConnected: true).isEmpty, "过期终态不得再次提示")
+            let otherTurn = RemoteActivityTask(id: id, provider: provider, state: "completed", project: "p", updatedAt: 20, startedAt: 15, modelName: "m")
+            let changed = RemoteActivityFrame(schema: 1, epoch: frame.epoch, revision: 3, sentAt: 21, tasks: [otherTurn])
+            precondition(RemoteActivityController.liveTerminals(previous: [previous], frame: changed, wasConnected: true).isEmpty, "新轮次不得借用旧轮次的实时资格")
+        }
     }
 
     static func verifyStatusItemLifetime() {
@@ -202,8 +227,8 @@ struct UsageCommandSmoke {
             provider: "codex",
             state: "running",
             project: "remote",
-            updatedAt: 1001,
-            startedAt: 1000,
+            updatedAt: Date().timeIntervalSince1970,
+            startedAt: Date().timeIntervalSince1970 - 1,
             modelName: "remote-model", eventName: "PreToolUse", toolName: "Bash", activeSubagentCount: 1
         )
         let sources = [UsageSource(id: "a", name: "machine-a", address: "a"), UsageSource(id: "b", name: "machine-b", address: "b")]
