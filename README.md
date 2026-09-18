@@ -23,7 +23,7 @@
 
 CodexBar 是面向 macOS 15 及更高版本的菜单栏 App，集中展示 Codex 额度、任务状态，以及本机和远程设备的 Codex、Claude Code 用量。
 
-> 本仓库基于 [bob-zebedy/CodexBar](https://github.com/bob-zebedy/CodexBar) 独立维护。保留原菜单栏交互，增加多机器统计、Claude 被动额度和订阅价值估算；下载、更新与反馈均使用本仓库。
+> 本仓库是 [bob-zebedy/CodexBar](https://github.com/bob-zebedy/CodexBar) 的独立 fork。原生菜单栏界面、Codex 额度与任务能力来自原作；本分支在此基础上增加 Claude Code、多机器统计和订阅价值估算。上游更新经审核适配后引入，下载、更新与反馈使用本仓库。
 
 ## 功能
 
@@ -137,6 +137,12 @@ bash Scripts/build-local.sh
 ## 反馈
 
 Bug、功能建议或使用问题欢迎通过 [GitHub Issues](https://github.com/yatotm/CodexBar/issues) 反馈。
+
+## 致谢
+
+感谢 [bob-zebedy/CodexBar](https://github.com/bob-zebedy/CodexBar) 的原作者及贡献者提供的基础与持续维护。
+
+本项目认可并支持 [LINUX DO](https://linux.do/) 社区，感谢社区为开源项目提供分享与交流的平台。
 
 ## 许可证
 

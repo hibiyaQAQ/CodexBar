@@ -23,7 +23,7 @@
 
 CodexBar is a macOS 15+ menu bar app for Codex quotas and task status, plus Codex and Claude Code usage across local and remote machines.
 
-> This independently maintained fork is based on [bob-zebedy/CodexBar](https://github.com/bob-zebedy/CodexBar). Downloads, updates, and issue reports use this repository.
+> This is an independently maintained fork of [bob-zebedy/CodexBar](https://github.com/bob-zebedy/CodexBar). The original provides the native menu bar interface, Codex quotas, and task tracking. This fork adds Claude Code, multi-machine usage, and subscription value estimates. Upstream changes are reviewed and adapted; downloads, updates, and issue reports use this repository.
 
 ## Features
 
@@ -124,6 +124,12 @@ See [Data, Sync, and Privacy](Docs/en/UserGuide/sync-data-privacy.md) for comple
 ## Feedback
 
 Report bugs, request features, or ask questions through [GitHub Issues](https://github.com/yatotm/CodexBar/issues).
+
+## Acknowledgements
+
+Thanks to the author and contributors of [bob-zebedy/CodexBar](https://github.com/bob-zebedy/CodexBar) for the original project and its ongoing maintenance.
+
+This project recognizes and supports the [LINUX DO](https://linux.do/) community. Thank you for providing a place to share open-source projects and exchange technical knowledge.
 
 ## License
 
