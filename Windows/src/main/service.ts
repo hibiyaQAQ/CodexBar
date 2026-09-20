@@ -367,18 +367,28 @@ export class CodexBarService {
         const commandText = hookCommandText(this.hookInvocation);
         let installed = false;
         let complete = false;
+        let configReadable = true;
         let message = this.hookMessage;
         try {
             const config = readHooksConfig(this.environment);
             installed = containsAnyCodexBarHook(config, this.hookInvocation);
             complete = containsAllCodexBarHooks(config, this.hookInvocation);
+            // 已开启但配置缺项时自愈, 常见于安装路径或 node 位置发生变化
+            if (this.settings.hookEnabled && !complete) {
+                const { config: next, repaired } = installCodexBarHooks(config, this.hookInvocation);
+                writeHooksConfig(next, this.environment);
+                installed = true;
+                complete = true;
+                log("hooks", "notice", "Hook 配置已补齐", { events: repaired.length });
+            }
         } catch (error) {
             // 读取失败不提供 Hook 装没装的信息, 保留上次结论
+            configReadable = false;
             message = "hooks.json 无法读取, 保留上次状态";
             log("hooks", "error", "Hook 配置读取失败", { detail: describe(error) });
         }
         const supportsHooks = isVersionAtLeast(this.session?.serverVersion ?? null, minimumHookCodexVersion) === true;
-        if (this.settings.hookEnabled && complete && supportsHooks) {
+        if (this.settings.hookEnabled && complete && supportsHooks && configReadable) {
             const verification = await this.verifyHooks();
             this.hookVerified = verification.verified;
             this.hookMessage = verification.message;

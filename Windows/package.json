@@ -2,7 +2,7 @@
     "name": "codexbar-win",
     "productName": "CodexBar",
     "version": "1.0.0",
-    "description": "CodexBar for Windows: Codex 与 Claude Code 额度, Token 用量和 Hook 统计的系统托盘应用",
+    "description": "CodexBar for Windows: Codex \u4e0e Claude Code \u989d\u5ea6, Token \u7528\u91cf\u548c Hook \u7edf\u8ba1\u7684\u7cfb\u7edf\u6258\u76d8\u5e94\u7528",
     "license": "GPL-3.0-only",
     "main": "dist/main/index.js",
     "scripts": {
@@ -10,7 +10,8 @@
         "start": "npm run build && electron .",
         "test": "npm run build && node --test dist/test/*.test.js",
         "package": "npm run build && electron-builder --win --x64",
-        "icons": "node scripts/make-icons.js"
+        "icons": "node scripts/make-icons.js",
+        "doctor": "npm run build && node dist/tools/doctor.js"
     },
     "devDependencies": {
         "@types/jsdom": "^30.0.0",

@@ -198,3 +198,28 @@ test("关闭 Hook 只移除自己的 handler", async () => {
         sandbox.dispose();
     }
 });
+
+test("已开启但配置缺项时自动补齐", async () => {
+    const sandbox = makeSandbox("service");
+    try {
+        installFakeCodex(sandbox);
+        const service = makeService(sandbox);
+        await service.refresh("test");
+        await service.setHookEnabled(true);
+
+        // 模拟用户手工删掉了其中一个事件
+        const config = readHooksConfig(sandbox.environment) as { hooks: Record<string, unknown> };
+        delete config.hooks.PostToolUse;
+        const target = path.join(sandbox.environment.home, ".codex", "hooks.json");
+        fs.writeFileSync(target, JSON.stringify(config), "utf8");
+        assert.equal(containsAllCodexBarHooks(readHooksConfig(sandbox.environment), hookInvocation), false);
+
+        const snapshot = await service.refresh("test");
+        service.dispose();
+        assert.equal(snapshot.hook.complete, true);
+        assert.equal(containsAllCodexBarHooks(readHooksConfig(sandbox.environment), hookInvocation), true);
+    } finally {
+        delete process.env.CODEXBAR_DATA_DIR;
+        sandbox.dispose();
+    }
+});

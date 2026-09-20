@@ -57,9 +57,17 @@ npm run package
 npm test
 ```
 
-测试使用 Node 内置的 `node:test`，覆盖路径解析、额度模型、Hook 事件编码、历史聚合、热力图、额度估算、`hooks.json` 改写、`app-server` JSON-RPC、Claude 日志解析、服务装配与渲染层。测试全部在独立临时目录中运行，不会读写真实的 `~/.codex`、`~/.claude` 与应用数据目录。
+测试使用 Node 内置的 `node:test`，覆盖路径解析、额度模型、Hook 事件编码、历史聚合、热力图、额度估算、`hooks.json` 改写、`app-server` JSON-RPC、Claude 日志解析、服务装配、主进程装配与渲染层。测试全部在独立临时目录中运行，不会读写真实的 `~/.codex`、`~/.claude` 与应用数据目录。
 
-`app-server` 与 Hook 子进程使用替身脚本验证，不需要真实的 Codex 登录状态。
+`app-server` 与 Hook 子进程使用替身脚本验证，不需要真实的 Codex 登录状态；主进程用桩替换 `electron`，渲染层在 jsdom 中挂载真实页面并断言渲染结果。
+
+第一次在自己的机器上排查环境时，可以运行不启动界面的自检：
+
+```powershell
+npm run doctor
+```
+
+它会打印 Codex 与 Claude 配置目录、解析到的 `codex` 路径与实际运行版本、账户与套餐、主次窗口已用比例、Hook 配置状态与命令，以及本机会话扫描进度。
 
 ## CodexBar Hook
 
@@ -71,6 +79,8 @@ npm test
 4. 需要时用 `config/batchWrite` 写入 `hooks.state` 的 `trusted_hash`，完成信任
 
 Hook 命令优先写成 `node "<安装目录>\resources\hook\record.js" --hook-event`，没有 `node` 时回退到应用自身的 `--hook-event` 模式。子进程读取 `stdin` 的 JSON 负载，在锁内追加一行 JSONL 后立即退出，任何失败都静默吞掉，不会阻断 Codex。
+
+开关保持开启时，每轮刷新都会比对配置：缺少事件或命令路径发生变化会自动补齐，这样升级安装目录或更换 `node` 位置后不需要手工重开开关。
 
 关闭开关时只移除 command 同时包含当前可执行路径与 `--hook-event` 的 handler。
 
