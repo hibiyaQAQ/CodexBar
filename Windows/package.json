@@ -1,0 +1,54 @@
+{
+    "name": "codexbar-win",
+    "productName": "CodexBar",
+    "version": "1.0.0",
+    "description": "CodexBar for Windows: Codex \u4e0e Claude Code \u989d\u5ea6, Token \u7528\u91cf\u548c Hook \u7edf\u8ba1\u7684\u7cfb\u7edf\u6258\u76d8\u5e94\u7528",
+    "license": "GPL-3.0-only",
+    "main": "dist/main/index.js",
+    "scripts": {
+        "build": "tsc -p tsconfig.json && node scripts/copy-assets.js",
+        "start": "npm run build && electron .",
+        "test": "npm run build && node --test dist/test/*.test.js",
+        "package": "npm run build && electron-builder --win --x64",
+        "icons": "node scripts/make-icons.js",
+        "doctor": "npm run build && node dist/tools/doctor.js"
+    },
+    "devDependencies": {
+        "@types/jsdom": "^30.0.0",
+        "@types/node": "^22.10.2",
+        "electron": "^33.3.1",
+        "electron-builder": "^25.1.8",
+        "jsdom": "^30.1.0",
+        "typescript": "^5.7.2"
+    },
+    "build": {
+        "appId": "io.github.yatotm.codexbar",
+        "productName": "CodexBar",
+        "directories": {
+            "output": "release"
+        },
+        "files": [
+            "dist/**/*",
+            "resources/**/*",
+            "package.json"
+        ],
+        "extraResources": [
+            {
+                "from": "hook",
+                "to": "hook"
+            }
+        ],
+        "win": {
+            "target": [
+                "nsis",
+                "zip"
+            ],
+            "icon": "resources/icon.png"
+        },
+        "nsis": {
+            "oneClick": false,
+            "allowToChangeInstallationDirectory": true,
+            "shortcutName": "CodexBar"
+        }
+    }
+}

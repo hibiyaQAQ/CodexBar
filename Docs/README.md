@@ -26,6 +26,7 @@
 - [UI 与应用生命周期](DeveloperGuide/ui-and-lifecycle.md)
 - [数据与隐私边界](DeveloperGuide/data-and-privacy.md)
 - [开发与验证](DeveloperGuide/development.md)
+- [Windows 移植](../Windows/README.md)
 
 ## 在线资料
 

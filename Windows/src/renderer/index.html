@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:">
+    <title>CodexBar</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header class="titlebar">
+        <div class="brand">
+            <span class="logo"></span>
+            <span class="brand-name">CodexBar</span>
+        </div>
+        <div class="titlebar-actions">
+            <span id="refresh-state" class="refresh-state"></span>
+            <button id="refresh" class="icon-button" title="立即刷新">刷新</button>
+        </div>
+    </header>
+
+    <nav class="tabs">
+        <button class="tab active" data-tab="codex">Codex</button>
+        <button class="tab" data-tab="claude">Claude</button>
+        <button class="tab" data-tab="settings">设置</button>
+    </nav>
+
+    <main>
+        <section id="tab-codex" class="tab-page active"></section>
+        <section id="tab-claude" class="tab-page"></section>
+        <section id="tab-settings" class="tab-page"></section>
+    </main>
+
+    <footer class="statusbar">
+        <span id="status-text">正在加载</span>
+        <span id="status-time"></span>
+    </footer>
+
+    <script src="renderer.js"></script>
+</body>
+</html>
